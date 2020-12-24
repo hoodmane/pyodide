@@ -34,14 +34,7 @@ main(int argc, char** argv)
 #ifdef TEST
   EM_ASM({
     Module.TestEntrypoints = {};
-    Module.TestEntrypoints.raise_on_fail = function(result)
-    {
-      if (result) {
-        let msg = UTF8ToString(result);
-        _free(result);
-        throw new Error(msg);
-      }
-    }
+    Module.TestEntrypoints.test_entrypoints = function() { return "It works!"; }
   });
 #endif
   TRY_INIT(hiwire);
