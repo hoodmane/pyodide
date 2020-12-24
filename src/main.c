@@ -32,9 +32,19 @@ int
 main(int argc, char** argv)
 {
 #ifdef TEST
-  EM_ASM({ Module.TestEntrypoints = {}; });
+  EM_ASM({
+    Module.TestEntrypoints = {};
+    Module.TestEntrypoints.raise_on_fail = function(result)
+    {
+      if (result) {
+        let msg = UTF8ToString(result);
+        _free(result);
+        throw new Error(msg);
+      }
+    }
+  });
 #endif
-  hiwire_setup();
+  TRY_INIT(hiwire);
   setenv("PYTHONHOME", "/", 0);
 
   Py_InitializeEx(0);

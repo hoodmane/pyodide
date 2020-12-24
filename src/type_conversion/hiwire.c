@@ -1,6 +1,7 @@
-#include <emscripten.h>
-
 #include "hiwire.h"
+#include "testmacros.h"
+#include <emscripten.h>
+#include <stddef.h>
 
 int
 hiwire_error()
@@ -37,55 +38,6 @@ hiwire_bool(int boolean)
 {
   return boolean ? hiwire_true() : hiwire_false();
 }
-
-EM_JS(void, hiwire_setup, (), {
-  let _hiwire = { objects : new Map(), counter : 1 };
-  Module.hiwire = {};
-  Module.hiwire.ERROR = _hiwire_error();
-  Module.hiwire.UNDEFINED = _hiwire_undefined();
-  Module.hiwire.NULL = _hiwire_null();
-  Module.hiwire.TRUE = _hiwire_true();
-  Module.hiwire.FALSE = _hiwire_false();
-
-  _hiwire.objects.set(Module.hiwire.UNDEFINED, undefined);
-  _hiwire.objects.set(Module.hiwire.NULL, null);
-  _hiwire.objects.set(Module.hiwire.TRUE, true);
-  _hiwire.objects.set(Module.hiwire.FALSE, false);
-
-  Module.hiwire.new_value = function(jsval)
-  {
-    // Should we guard against duplicating standard values?
-    // Probably not worth it for performance: it's harmless to ocassionally
-    // duplicate. Maybe in test builds we could raise if jsval is a standard
-    // value?
-    while (_hiwire.objects.has(_hiwire.counter)) {
-      _hiwire.counter = (_hiwire.counter + 1) & 0x7fffffff;
-    }
-    let idval = _hiwire.counter;
-    _hiwire.objects.set(idval, jsval);
-    _hiwire.counter = (_hiwire.counter + 1) & 0x7fffffff;
-    return idval;
-  };
-
-  Module.hiwire.get_value = function(idval)
-  {
-    if (!idval) {
-      throw new Error("Argument to hiwire.get_value is undefined");
-    }
-    if (!_hiwire.objects.has(idval)) {
-      throw new Error(`Undefined id $ { idval }`);
-    }
-    return _hiwire.objects.get(idval);
-  };
-
-  Module.hiwire.decref = function(idval)
-  {
-    if (idval < 0) {
-      return;
-    }
-    _hiwire.objects.delete(idval);
-  };
-});
 
 EM_JS(int, hiwire_incref, (int idval), {
   if (idval < 0) {
@@ -450,3 +402,112 @@ EM_JS(int, hiwire_subarray, (int idarr, int start, int end), {
   var jssub = jsarr.subarray(start, end);
   return Module.hiwire.new_value(jssub);
 });
+
+EM_JS(int, hiwire_init, (), {
+  let _hiwire = { objects : new Map(), counter : 1 };
+  Module.hiwire = {};
+  Module.hiwire.ERROR = _hiwire_error();
+  Module.hiwire.UNDEFINED = _hiwire_undefined();
+  Module.hiwire.NULL = _hiwire_null();
+  Module.hiwire.TRUE = _hiwire_true();
+  Module.hiwire.FALSE = _hiwire_false();
+
+  _hiwire.objects.set(Module.hiwire.UNDEFINED, undefined);
+  _hiwire.objects.set(Module.hiwire.NULL, null);
+  _hiwire.objects.set(Module.hiwire.TRUE, true);
+  _hiwire.objects.set(Module.hiwire.FALSE, false);
+
+  Module.hiwire.new_value = function(jsval)
+  {
+    // Should we guard against duplicating standard values?
+    // Probably not worth it for performance: it's harmless to ocassionally
+    // duplicate. Maybe in test builds we could raise if jsval is a standard
+    // value?
+    while (_hiwire.objects.has(_hiwire.counter)) {
+      _hiwire.counter = (_hiwire.counter + 1) & 0x7fffffff;
+    }
+    let idval = _hiwire.counter;
+    _hiwire.objects.set(idval, jsval);
+    _hiwire.counter = (_hiwire.counter + 1) & 0x7fffffff;
+    return idval;
+  };
+
+  Module.hiwire.get_value = function(idval)
+  {
+    if (!idval) {
+      throw new Error("Argument to hiwire.get_value is undefined");
+    }
+    if (!_hiwire.objects.has(idval)) {
+      throw new Error(`Undefined id $ { idval }`);
+    }
+    return _hiwire.objects.get(idval);
+  };
+
+  Module.hiwire.decref = function(idval)
+  {
+    if (idval < 0) {
+      return;
+    }
+    _hiwire.objects.delete(idval);
+  };
+
+  if (!Module.TestEntrypoints) {
+    return;
+  }
+  // Tests:
+
+  let hiwire_tests = {};
+  Module.TestEntrypoints.hiwire_tests = hiwire_tests;
+  let raise_on_fail = Module.TestEntrypoints.raise_on_fail;
+  hiwire_tests.test_int = function() { raise_on_fail(_test_int()); };
+  hiwire_tests.test_ref = function() { raise_on_fail(_test_refs()); };
+
+  return 0;
+});
+
+#ifdef TEST
+
+EM_JS(int, get_value_throws, (int id), {
+  try {
+    Module.hiwire.get_value(id);
+  } catch (e) {
+    return true;
+  }
+  return false;
+});
+
+char*
+test_refs()
+{
+  char* failure_msg = NULL;
+  int value = 77;
+  int id1, id2;
+  int result;
+  id1 = hiwire_int(value);
+  ASSERT(!get_value_throws(id1));
+  id2 = hiwire_incref(id1);
+  ASSERT(!get_value_throws(id2));
+  // clang-format off
+  ASSERT(!EM_ASM_INT(
+    { return Module.hiwire.get_value($0) === Module.hiwire.get_value($1); }, id1, id2));
+  // clang-format on
+  hiwire_decref(id1);
+  ASSERT(get_value_throws(id1));
+  ASSERT(!get_value_throws(id2));
+  hiwire_decref(id2);
+  ASSERT(get_value_throws(id2));
+  return failure_msg;
+}
+
+char*
+test_int()
+{
+  char* failure_msg = NULL;
+  int value = 77;
+  int id = hiwire_int(value);
+  ASSERT(value == EM_ASM_INT({ return Module.hiwire.get_value($0); }, id));
+  hiwire_decref(id);
+  return failure_msg;
+}
+
+#endif

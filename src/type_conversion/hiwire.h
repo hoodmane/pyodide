@@ -25,8 +25,8 @@
 /**
  * Initialize the variables and functions required for hiwire.
  */
-void
-hiwire_setup();
+int
+hiwire_init();
 
 /**
  * Increase the reference count on an object.
