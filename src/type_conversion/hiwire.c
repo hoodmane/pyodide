@@ -451,21 +451,27 @@ EM_JS(int, hiwire_init, (), {
     _hiwire.objects.delete(idval);
   };
 
-  if (!Module.TestEntrypoints) {
-    return;
+  if (Module.TestEntrypoints) {
+    hiwire_define_tests();
   }
-  // Tests:
-
-  let hiwire_tests = {};
-  Module.TestEntrypoints.hiwire_tests = hiwire_tests;
-  let raise_on_fail = Module.TestEntrypoints.raise_on_fail;
-  hiwire_tests.test_int = function() { raise_on_fail(_test_int()); };
-  hiwire_tests.test_ref = function() { raise_on_fail(_test_refs()); };
 
   return 0;
 });
 
 #ifdef TEST
+
+EM_JS(void, hiwire_define_tests, (), {
+  // Tests:
+  let hiwire_tests = {};
+  Module.TestEntrypoints.hiwire_tests = hiwire_tests;
+  let raise_on_fail = Module.TestEntrypoints.raise_on_fail;
+  Module.to_c_string(s){
+    return allocate(intArrayFromString(code), 'i8', ALLOC_NORMAL);
+  }
+  hiwire_tests.test_int = function() { raise_on_fail(_hiwire_test_refs()); };
+  hiwire_tests.test_ref = function() { raise_on_fail(_hiwire_test_int()); };
+}
+
 
 EM_JS(int, get_value_throws, (int id), {
   try {
@@ -477,7 +483,18 @@ EM_JS(int, get_value_throws, (int id), {
 });
 
 char*
-test_refs()
+hiwire_test_int()
+{
+  char* failure_msg = NULL;
+  int value = 77;
+  int id = hiwire_int(value);
+  ASSERT(value == EM_ASM_INT({ return Module.hiwire.get_value($0); }, id));
+  hiwire_decref(id);
+  return failure_msg;
+}
+
+char*
+hiwire_test_refs()
 {
   char* failure_msg = NULL;
   int value = 77;
@@ -499,15 +516,26 @@ test_refs()
   return failure_msg;
 }
 
+
+
 char*
-test_int()
-{
+hiwire_test_get_iter(){
   char* failure_msg = NULL;
-  int value = 77;
-  int id = hiwire_int(value);
-  ASSERT(value == EM_ASM_INT({ return Module.hiwire.get_value($0); }, id));
-  hiwire_decref(id);
-  return failure_msg;
+  int map_id = EM_ASM_INT({
+    let result = new Map();
+    result.set(1, 100);
+    result.set("a", 66);
+    return Module.hiwire.new_value(result);
+  });
+  int iter_id = hiwire_get_iterator(map_id);
+  EM_ASM_INT({
+    let map = Module.hiwire.get_value($0);
+    let result = Array.from();
+    JSON.stringify(result) === "[[1,100]]"
+  }, map_id, iter_id)
+
+  hiwire_decref(map_id);
+
 }
 
-#endif
+#endif // TEST
