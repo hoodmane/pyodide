@@ -359,40 +359,19 @@ EM_JS(int, hiwire_copy_to_ptr, (int idobj, int ptr), {
 
 EM_JS(int, hiwire_get_dtype, (int idobj), {
   var jsobj = Module.hiwire.get_value(idobj);
-  switch (jsobj.constructor.name) {
-    case 'Int8Array':
-      dtype = 1; // INT8_TYPE;
-      break;
-    case 'Uint8Array':
-      dtype = 2; // UINT8_TYPE;
-      break;
-    case 'Uint8ClampedArray':
-      dtype = 3; // UINT8CLAMPED_TYPE;
-      break;
-    case 'Int16Array':
-      dtype = 4; // INT16_TYPE;
-      break;
-    case 'Uint16Array':
-      dtype = 5; // UINT16_TYPE;
-      break;
-    case 'Int32Array':
-      dtype = 6; // INT32_TYPE;
-      break;
-    case 'Uint32Array':
-      dtype = 7; // UINT32_TYPE;
-      break;
-    case 'Float32Array':
-      dtype = 8; // FLOAT32_TYPE;
-      break;
-    case 'Float64Array':
-      dtype = 9; // FLOAT64_TYPE;
-      break;
-    case 'ArrayBuffer':
-      dtype = 3;
-      break;
-    default:
-      dtype = 3; // UINT8CLAMPED_TYPE;
-      break;
+  if(!Module.hiwire.dtype_map){
+    Module.hiwire.dtype_map = new Map(Object.entries({
+      'Int8Array' : 1, // INT8_TYPE;
+      'Uint8Array' : 2, // UINT8_TYPE;
+      'Uint8ClampedArray' : 3, // UINT8CLAMPED_TYPE;
+      'Int16Array' : 4, // INT16_TYPE;
+      'Uint16Array' : 5, // UINT16_TYPE;
+      'Int32Array' : 6, // INT32_TYPE;
+      'Uint32Array' : 7, // UINT32_TYPE;
+      'Float32Array' : 8, // FLOAT32_TYPE;
+      'Float64Array' : 9, // FLOAT64_TYPE;
+      'ArrayBuffer' : 3, // UINT8CLAMPED_TYPE;
+    }));
   }
   return dtype;
 });
@@ -452,7 +431,7 @@ EM_JS(int, hiwire_init, (), {
   };
 
   if (Module.TestEntrypoints) {
-    hiwire_define_tests();
+    _hiwire_define_tests();
   }
 
   return 0;
@@ -465,37 +444,35 @@ EM_JS(void, hiwire_define_tests, (), {
   let hiwire_tests = {};
   Module.TestEntrypoints.hiwire_tests = hiwire_tests;
   let raise_on_fail = Module.TestEntrypoints.raise_on_fail;
-  Module.to_c_string(s){
-    return allocate(intArrayFromString(code), 'i8', ALLOC_NORMAL);
-  }
-  hiwire_tests.test_int = function() { raise_on_fail(_hiwire_test_refs()); };
-  hiwire_tests.test_ref = function() { raise_on_fail(_hiwire_test_int()); };
-}
+  // Module.to_c_string = function(s){
+  //   return allocate(intArrayFromString(code), 'i8', ALLOC_NORMAL);
+  // }
+  hiwire_tests.refs = _test_hiwire_refs;
+  hiwire_tests.int = _test_hiwire_int;
+  hiwire_tests.get_iter = _test_hiwire_get_iter;
+});
 
 
 EM_JS(int, get_value_throws, (int id), {
   try {
+    console.log("trying to get value");
     Module.hiwire.get_value(id);
   } catch (e) {
+    console.log("caught error");
     return true;
   }
+  console.log("no error");
   return false;
 });
 
-char*
-hiwire_test_int()
-{
-  char* failure_msg = NULL;
+DEFINE_TEST(hiwire_int, {
   int value = 77;
   int id = hiwire_int(value);
   ASSERT(value == EM_ASM_INT({ return Module.hiwire.get_value($0); }, id));
   hiwire_decref(id);
-  return failure_msg;
-}
+})
 
-char*
-hiwire_test_refs()
-{
+DEFINE_TEST(hiwire_refs, {
   char* failure_msg = NULL;
   int value = 77;
   int id1, id2;
@@ -514,28 +491,49 @@ hiwire_test_refs()
   hiwire_decref(id2);
   ASSERT(get_value_throws(id2));
   return failure_msg;
-}
+})
 
 
-
-char*
-hiwire_test_get_iter(){
+DEFINE_TEST(hiwire_get_iter, {
   char* failure_msg = NULL;
-  int map_id = EM_ASM_INT({
-    let result = new Map();
-    result.set(1, 100);
-    result.set("a", 66);
-    return Module.hiwire.new_value(result);
-  });
-  int iter_id = hiwire_get_iterator(map_id);
-  EM_ASM_INT({
-    let map = Module.hiwire.get_value($0);
-    let result = Array.from();
-    JSON.stringify(result) === "[[1,100]]"
-  }, map_id, iter_id)
+  ASSERT(EM_ASM_INT({
+    let map = new Map();
+    map.set(1, 100);
+    map.set("a", 66);
+    let map_id = Module.hiwire.new_value(map);
+    let iter_id = _hiwire_get_iterator(map_id);
+    let result = Array.from(Module.hiwire.get_value(iter_id));
+    Module.hiwire.decref(map_id);
+    Module.hiwire.decref(iter_id);
+    console.log(JSON.stringify(result));
+    return JSON.stringify(result) === '[[1,100],["a",66]]';
+  }));
 
-  hiwire_decref(map_id);
+  ASSERT(EM_ASM_INT({
+    // EM_ASM gets confused by {}, but with extra () it's okay.
+    let obj = ({ 1 : 100, a : 66 });
+    let obj_id = Module.hiwire.new_value(obj);
+    let iter_id = _hiwire_get_iterator(obj_id);
+    let result = Array.from(Module.hiwire.get_value(iter_id));
+    Module.hiwire.decref(obj_id);
+    Module.hiwire.decref(iter_id);
+    console.log(JSON.stringify(result));
+    return JSON.stringify(result) === '[["1",100],["a",66]]';
+  }));
 
+  ASSERT(EM_ASM_INT({
+    let map = new Map();
+    map.set(1, 100);
+    map.set("a", 66);
+    let iter = map[Symbol.iterator];
+    let iter_id = Module.hiwire.new_value(iter);
+    let iter2_id = _hiwire_get_iterator(iter_id);
+    let result = Array.from(Module.hiwire.get_value(iter2_id));
+    hiwire_decref(iter_id);
+    hiwire_decref(iter2_id);
+    return JSON.stringify(result) === '[[1,100],["a",66]]';
+  }));
+  return failure_msg;
 }
 
 #endif // TEST
