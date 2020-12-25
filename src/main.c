@@ -77,17 +77,17 @@ main(int argc, char** argv)
 
 #ifdef TEST
 EM_JS(int, init_test_entrypoints, (), {
-  Module.TestEntrypoints = {};
-  Module.TestEntrypoints.test_entrypoints = function() { return "It works!"; };
-  Module.TestEntrypoints.raise_on_fail = function(result){
+  Module.Tests = {};
+  Module.Tests.test_entrypoints = function() { return "It works!"; };
+  Module.Tests.raise_on_fail = function(result){
     if (result) {
       let msg = UTF8ToString(result);
       _free(result);
       throw new Error(msg);
     }
   };
-  Module.TestEntrypoints.test_c_tests_success =  _test_c_tests_success;
-  Module.TestEntrypoints.test_c_tests_fail =  _test_c_tests_fail;
+  Module.Tests.test_c_tests_success =  _test_c_tests_success;
+  Module.Tests.test_c_tests_fail =  _test_c_tests_fail;
 });
 
 DEFINE_TEST(

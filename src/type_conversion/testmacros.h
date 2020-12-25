@@ -24,5 +24,5 @@
     return failure_msg;\
   }\
   EM_JS(void, test_ ## name, (), {\
-    Module.TestEntrypoints.raise_on_fail(_inner_test_ ## name());\
+    Module.Tests.raise_on_fail(_inner_test_ ## name());\
   })
