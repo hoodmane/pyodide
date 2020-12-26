@@ -1,5 +1,5 @@
 #include "hiwire.h"
-#include "testmacros.h"
+#include "testing.h"
 #include <emscripten.h>
 #include <stddef.h>
 
@@ -293,12 +293,12 @@ MAKE_OPERATOR(greater_than_equal, >=);
 EM_JS(int, hiwire_next, (int idobj), {
   // clang-format off
   if (idobj === Module.hiwire.UNDEFINED) {
+  // clang-format on
     return Module.hiwire.ERROR;
   }
 
   var jsobj = Module.hiwire.get_value(idobj);
   return Module.hiwire.new_value(jsobj.next());
-  // clang-format on
 });
 
 EM_JS(int, hiwire_get_iterator, (int idobj), {
@@ -430,28 +430,10 @@ EM_JS(int, hiwire_init, (), {
     _hiwire.objects.delete(idval);
   };
 
-  if (Module.TestEntrypoints) {
-    _hiwire_define_tests();
-  }
-
   return 0;
 });
 
 #ifdef TEST
-
-EM_JS(void, hiwire_define_tests, (), {
-  // Tests:
-  let hiwire_tests = {};
-  Module.TestEntrypoints.hiwire_tests = hiwire_tests;
-  let raise_on_fail = Module.TestEntrypoints.raise_on_fail;
-  // Module.to_c_string = function(s){
-  //   return allocate(intArrayFromString(code), 'i8', ALLOC_NORMAL);
-  // }
-  hiwire_tests.refs = _test_hiwire_refs;
-  hiwire_tests.int = _test_hiwire_int;
-  hiwire_tests.get_iter = _test_hiwire_get_iter;
-});
-
 
 EM_JS(int, get_value_throws, (int id), {
   try {
@@ -473,7 +455,6 @@ DEFINE_TEST(hiwire_int, {
 })
 
 DEFINE_TEST(hiwire_refs, {
-  char* failure_msg = NULL;
   int value = 77;
   int id1, id2;
   int result;
@@ -490,12 +471,9 @@ DEFINE_TEST(hiwire_refs, {
   ASSERT(!get_value_throws(id2));
   hiwire_decref(id2);
   ASSERT(get_value_throws(id2));
-  return failure_msg;
 })
 
-
 DEFINE_TEST(hiwire_get_iter, {
-  char* failure_msg = NULL;
   ASSERT(EM_ASM_INT({
     let map = new Map();
     map.set(1, 100);
@@ -506,7 +484,9 @@ DEFINE_TEST(hiwire_get_iter, {
     Module.hiwire.decref(map_id);
     Module.hiwire.decref(iter_id);
     console.log(JSON.stringify(result));
+    // clang-format off
     return JSON.stringify(result) === '[[1,100],["a",66]]';
+    // clang-format on
   }));
 
   ASSERT(EM_ASM_INT({
@@ -518,7 +498,9 @@ DEFINE_TEST(hiwire_get_iter, {
     Module.hiwire.decref(obj_id);
     Module.hiwire.decref(iter_id);
     console.log(JSON.stringify(result));
+    // clang-format off
     return JSON.stringify(result) === '[["1",100],["a",66]]';
+    // clang-format on
   }));
 
   ASSERT(EM_ASM_INT({
@@ -531,9 +513,10 @@ DEFINE_TEST(hiwire_get_iter, {
     let result = Array.from(Module.hiwire.get_value(iter2_id));
     hiwire_decref(iter_id);
     hiwire_decref(iter2_id);
+    // clang-format off
     return JSON.stringify(result) === '[[1,100],["a",66]]';
+    // clang-format on
   }));
-  return failure_msg;
 }
 
 #endif // TEST
