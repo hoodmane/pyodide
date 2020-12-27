@@ -312,6 +312,10 @@ var languagePluginLoader = new Promise((resolve, reject) => {
     'autocomplete',
   ];
 
+  if (self.TEST_PYODIDE) {
+    PUBLIC_API.push("Tests");
+  }
+
   function makePublicAPI(module, public_api) {
     var namespace = {_module : module};
     for (let name of public_api) {

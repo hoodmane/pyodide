@@ -1,3 +1,4 @@
+#include "testing.h"
 #include <Python.h>
 #include <emscripten.h>
 
@@ -30,8 +31,10 @@
 int
 main(int argc, char** argv)
 {
+#ifdef TEST
+  TRY_INIT(testing);
+#endif
   hiwire_setup();
-
   setenv("PYTHONHOME", "/", 0);
 
   Py_InitializeEx(0);
