@@ -96,7 +96,7 @@ JsProxy_SetAttr(PyObject* o, PyObject* attr_name, PyObject* pyvalue)
   if (pyvalue == NULL) {
     hiwire_delete_member_string(self->js, (int)key);
   } else {
-    int idvalue = python2js(pyvalue);
+    int idvalue = python2js_deep(pyvalue);
     hiwire_set_member_string(self->js, (int)key, idvalue);
     hiwire_decref(idvalue);
   }
@@ -115,13 +115,13 @@ JsProxy_Call(PyObject* o, PyObject* args, PyObject* kwargs)
   int idargs = hiwire_array();
 
   for (Py_ssize_t i = 0; i < nargs; ++i) {
-    int idarg = python2js(PyTuple_GET_ITEM(args, i));
+    int idarg = python2js_deep(PyTuple_GET_ITEM(args, i));
     hiwire_push_array(idargs, idarg);
     hiwire_decref(idarg);
   }
 
   if (PyDict_Size(kwargs)) {
-    int idkwargs = python2js(kwargs);
+    int idkwargs = python2js_deep(kwargs);
     hiwire_push_array(idargs, idkwargs);
     hiwire_decref(idkwargs);
   }
@@ -150,8 +150,8 @@ JsProxy_RichCompare(PyObject* a, PyObject* b, int op)
   }
 
   int result;
-  int ida = python2js(a);
-  int idb = python2js(b);
+  int ida = python2js_deep(a);
+  int idb = python2js_deep(b);
   switch (op) {
     case Py_LT:
       result = hiwire_less_than(ida, idb);
@@ -232,7 +232,7 @@ JsProxy_New(PyObject* o, PyObject* args, PyObject* kwargs)
   int idargs = hiwire_array();
 
   for (Py_ssize_t i = 0; i < nargs; ++i) {
-    int idarg = python2js(PyTuple_GET_ITEM(args, i));
+    int idarg = python2js_deep(PyTuple_GET_ITEM(args, i));
     hiwire_push_array(idargs, idarg);
     hiwire_decref(idarg);
   }
@@ -257,7 +257,7 @@ JsProxy_subscript(PyObject* o, PyObject* pyidx)
 {
   JsProxy* self = (JsProxy*)o;
 
-  int ididx = python2js(pyidx);
+  int ididx = python2js_deep(pyidx);
   int idresult = hiwire_get_member_obj(self->js, ididx);
   hiwire_decref(ididx);
   if (idresult == -1) {
@@ -273,11 +273,11 @@ static int
 JsProxy_ass_subscript(PyObject* o, PyObject* pyidx, PyObject* pyvalue)
 {
   JsProxy* self = (JsProxy*)o;
-  int ididx = python2js(pyidx);
+  int ididx = python2js_deep(pyidx);
   if (pyvalue == NULL) {
     hiwire_delete_member_obj(self->js, ididx);
   } else {
-    int idvalue = python2js(pyvalue);
+    int idvalue = python2js_deep(pyvalue);
     hiwire_set_member_obj(self->js, ididx, idvalue);
     hiwire_decref(idvalue);
   }
@@ -559,7 +559,7 @@ JsBoundMethod_Call(PyObject* o, PyObject* args, PyObject* kwargs)
   int idargs = hiwire_array();
 
   for (Py_ssize_t i = 0; i < nargs; ++i) {
-    int idarg = python2js(PyTuple_GET_ITEM(args, i));
+    int idarg = python2js_deep(PyTuple_GET_ITEM(args, i));
     hiwire_push_array(idargs, idarg);
     hiwire_decref(idarg);
   }

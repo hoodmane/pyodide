@@ -38,7 +38,7 @@ _pyproxy_get(int ptrobj, int idkey)
     return hiwire_undefined();
   }
 
-  int idattr = python2js(pyattr);
+  int idattr = python2js_deep(pyattr);
   Py_DECREF(pyattr);
   return idattr;
 };
@@ -100,7 +100,7 @@ _pyproxy_ownKeys(int ptrobj)
   Py_ssize_t n = PyList_Size(pydir);
   for (Py_ssize_t i = 0; i < n; ++i) {
     PyObject* pyentry = PyList_GetItem(pydir, i);
-    int identry = python2js(pyentry);
+    int identry = python2js_deep(pyentry);
     hiwire_push_array(iddir, identry);
     hiwire_decref(identry);
   }
@@ -132,7 +132,7 @@ _pyproxy_apply(int ptrobj, int idargs)
     Py_DECREF(pyargs);
     return pythonexc2js();
   }
-  int idresult = python2js(pyresult);
+  int idresult = python2js_deep(pyresult);
   Py_DECREF(pyresult);
   Py_DECREF(pyargs);
   return idresult;
@@ -170,6 +170,18 @@ EM_JS(int, pyproxy_new, (int ptrobj), {
 
   return Module.hiwire.new_value(proxy);
 });
+
+int
+get_pyproxy(PyObject* x)
+{
+  int ret;
+  if ((ret = pyproxy_use((int)x)) != HW_UNDEFINED) {
+    return ret;
+  }
+  // Reference counter is increased only once when a PyProxy is created.
+  Py_INCREF(x);
+  return pyproxy_new((int)x);
+}
 
 EM_JS(int, pyproxy_init, (), {
   // clang-format off
@@ -278,6 +290,8 @@ EM_JS(int, pyproxy_init, (), {
       return jsresult;
     },
   };
+
+  Module.TestEntrypoints.isPyProxy = Module.PyProxy.isPyProxy;
 
   return 0;
 // clang-format on

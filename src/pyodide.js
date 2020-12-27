@@ -311,7 +311,8 @@ var languagePluginLoader = new Promise((resolve, reject) => {
     'version',
     'autocomplete',
   ];
-
+  // window.TEST_PYODIDE flag to control exposure of extra private entrypoints
+  // needed for tests.
   if (self.TEST_PYODIDE) {
     PUBLIC_API.push("Tests");
   }

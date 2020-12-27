@@ -18,7 +18,18 @@ format_exc();
  *      On fail returns zero and sets a Python error.
  */
 int
-python2js(PyObject* x);
+python2js_deep(PyObject* x);
+
+/** Convert a Python object to a Javascript object.
+ *  \param The Python object
+ *  \return The Javascript object -- might be an Error object in the case of an
+ *     exception.
+ */
+int
+python2js_shallow(PyObject* x);
+
+int
+python2js_minimal(PyObject* x);
 
 int
 python2js_init();
