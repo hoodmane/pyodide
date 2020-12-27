@@ -301,6 +301,7 @@ var languagePluginLoader = new Promise((resolve, reject) => {
   let PUBLIC_API = [
     'globals',
     'loadPackage',
+    'loadPackagesForCode',
     'loadedPackages',
     'pyimport',
     'repr',
@@ -330,6 +331,41 @@ var languagePluginLoader = new Promise((resolve, reject) => {
   Module.preloadedWasm = {};
   let isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
 
+  // clang-format off
+
+  Module.runPython = function(code) { return Module.py_pyodide.eval_code(code, Module.globals); };
+
+  Module.loadPackagesForCode = async function(code, messageCallback, errorCallback) {
+    let imports = Module.py_pyodide.find_imports(code);
+    if (imports.length) {
+      let packageNames =
+          self.pyodide._module.packages.import_name_to_package_name;
+      let packages = new Set();
+      for (let name of imports) {
+        if (name in packageNames) {
+          packages.add(name);
+        }
+      }
+      if (packages.size) {
+        await loadPackage(
+          Array.from(packages.keys()),
+          messageCallback,
+        errorCallback);
+      }
+    }
+  };
+
+  Module.pyimport = function(name){
+    return Module.globals[name];
+  };
+
+  Module.runPythonAsync = async function(code, messageCallback, errorCallback) {
+    await Module.loadPackagesForCode(code, messageCallback, errorCallback);
+    return Module.py_pyodide.eval_code(code, Module.globals);
+  };
+
+  Module.version = function() { return Module.py_pyodide.__version__; };
+
   Module.checkABI = function(ABI_number) {
     if (ABI_number !== parseInt('{{ PYODIDE_PACKAGE_ABI }}')) {
       var ABI_mismatch_exception =
@@ -354,8 +390,6 @@ var languagePluginLoader = new Promise((resolve, reject) => {
           .then((response) => response.json())
           .then((json) => {
             fixRecursionLimit(self.pyodide);
-            self.pyodide.globals =
-                self.pyodide.runPython('import sys\nsys.modules["__main__"]');
             self.pyodide = makePublicAPI(self.pyodide, PUBLIC_API);
             self.pyodide._module.packages = json;
             if (self.iodide !== undefined) {
