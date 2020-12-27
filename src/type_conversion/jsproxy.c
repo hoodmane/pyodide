@@ -660,7 +660,6 @@ JsProxy_init()
   _Exc_JsException.tp_base = (PyTypeObject*)PyExc_Exception;
 
   PyObject* module;
-  PyObject* exc;
 
   // Add JsException to the pyodide module so people can catch it if they want.
   module = PyImport_ImportModule("pyodide");
