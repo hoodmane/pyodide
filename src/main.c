@@ -53,6 +53,7 @@ main(int argc, char** argv)
   }
   Py_DECREF(sys);
 
+  TRY_INIT(errors);
   TRY_INIT(js2python);
   TRY_INIT(JsImport);
   TRY_INIT(JsProxy);

@@ -10,18 +10,16 @@
  *  \return A Javascript Error object
  */
 int
-pythonexc2js();
+format_exc();
 
 /** Convert a Python object to a Javascript object.
  *  \param The Python object
- *  \return The Javascript object -- might be an Error object in the case of an
- *     exception.
+ *  \return On success returns a hiwire id for the javascript object.
+ *      On fail returns zero and sets a Python error.
  */
 int
 python2js(PyObject* x);
 
-/** Set up the global state for this module.
- */
 int
 python2js_init();
 

@@ -9,14 +9,12 @@
 
 /** Convert a Javascript object to a Python object.
  *  \param x The Javascript object.
- *  \return The Python object. New reference. If NULL, a Python exception
- *    occurred during the conversion, and the Python exception API should be
- *    used to obtain the exception.
+ *  \return The Python object. A new reference, must use Py_DECREF when done
+ * with it. On error returns NULL and sets a Python error.
  */
 PyObject*
 js2python(int x);
 
-/** Initialize any global variables used by this module. */
 int
 js2python_init();
 

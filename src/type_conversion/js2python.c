@@ -1,12 +1,9 @@
 #include "js2python.h"
 
-#include <emscripten.h>
-
+#include "conversion_error.h"
 #include "jsproxy.h"
 #include "pyproxy.h"
-
-// Since we're going *to* Python, just let any Python exceptions at conversion
-// bubble out to Python
+#include <emscripten.h>
 
 int
 _js2python_allocate_string(int size, int max_code_point)
@@ -150,7 +147,7 @@ EM_JS(int, __js2python, (int id), {
     return __js2python_pyproxy(Module.PyProxy.getPtr(value));
   } else if (value['byteLength'] !== undefined) {
     return __js2python_memoryview(id);
-  } else if (is_error(value)) { 
+  } else if (is_error(value)) {
     return __js2python_error(id);
   } else {
     return __js2python_jsproxy(id);
@@ -161,7 +158,21 @@ EM_JS(int, __js2python, (int id), {
 PyObject*
 js2python(int id)
 {
-  return (PyObject*)__js2python(id);
+  PyObject* result = (PyObject*)__js2python(id);
+  if (result == NULL) {
+    PyObject *exc, *val, *tb;
+    PyObject *new_exc, *new_val, *new_tb;
+    PyErr_Fetch(&exc, &val, &tb);
+    // TODO: Can we get a better string representation of the object?
+    // For instance: https://github.com/inspect-js/object-inspect
+    PyErr_Format(Js2PyConversionError,
+                 "Error occured while converting javascript object '%s'",
+                 hiwire_to_string(id));
+    PyErr_Fetch(&new_exc, &new_val, &new_tb);
+    PyException_SetCause(new_val, val);
+    PyErr_Restore(new_exc, new_val, new_tb);
+  }
+  return result;
 }
 
 int

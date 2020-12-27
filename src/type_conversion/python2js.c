@@ -13,8 +13,8 @@ static PyObject* tbmod = NULL;
 static int
 _python2js_unicode(PyObject* x);
 
-int
-pythonexc2js()
+void
+format_exc()
 {
   PyObject* type;
   PyObject* value;
@@ -341,11 +341,32 @@ python2js(PyObject* x)
   int result = _python2js_cache(x, map);
   Py_DECREF(map);
 
-  if (result == HW_ERROR) {
-    return pythonexc2js();
+  if (result != HW_ERROR) {
+    return result;
   }
 
-  return result;
+  PyObject *exc, *val, *tb;
+  PyObject *new_exc, *new_val, *new_tb;
+  PyErr_Fetch(&exc, &val, &tb);
+  char* repr_utf8 = NULL;
+  PyObject* repr = PyObject_Repr(x);
+  if (repr != NULL) {
+    repr_utf8 = PyUnicode_AsUTF8(repr);
+  }
+  if (repr_utf8) {
+    PyErr_Format(Py2JsConversionError,
+                 "Error occurred while converting python object. Repr:\n%s",
+                 repr_utf8);
+  } else {
+    PyErr_SetString(Py2JsConversionError,
+                    "Error occurred while converting a python object. (And a "
+                    "second error occurred while generating the repr.)");
+  }
+  Py_CLEAR(repr);
+  PyErr_Fetch(&new_exc, &new_val, &new_tb);
+  PyException_SetCause(new_val, val);
+  PyErr_Restore(new_exc, new_val, new_tb);
+  return HW_ERROR;
 }
 
 int

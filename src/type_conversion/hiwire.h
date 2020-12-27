@@ -16,7 +16,7 @@
 
 // Define special ids for singleton constants. These must be negative to
 // avoid being reused for other values.
-#define HW_ERROR -1
+#define HW_ERROR 0
 #define HW_UNDEFINED -2
 #define HW_TRUE -3
 #define HW_FALSE -4
