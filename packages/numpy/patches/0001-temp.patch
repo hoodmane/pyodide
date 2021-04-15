@@ -1,12 +1,12 @@
-From b7b632d279e1d75d22f00031891449e035dd4d6a Mon Sep 17 00:00:00 2001
+From 43fb0efa32d5b4d11149bbd521a06e3cd6aadbc9 Mon Sep 17 00:00:00 2001
 From: Hood <hood@mit.edu>
 Date: Fri, 2 Apr 2021 14:24:24 -0700
 Subject: [PATCH] temp
 
 ---
- numpy/core/src/multiarray/conversion_utils.c |  5 ++--
- numpy/core/src/multiarray/iterators.c        | 25 +++++++++++++++-----
- 2 files changed, 22 insertions(+), 8 deletions(-)
+ numpy/core/src/multiarray/conversion_utils.c |  5 +++--
+ numpy/core/src/multiarray/iterators.c        | 19 ++++++++++++++++++-
+ 2 files changed, 21 insertions(+), 3 deletions(-)
 
 diff --git a/numpy/core/src/multiarray/conversion_utils.c b/numpy/core/src/multiarray/conversion_utils.c
 index 52cb58726..5467f4d78 100644
@@ -33,10 +33,10 @@ index 52cb58726..5467f4d78 100644
      }
      return nd;
 diff --git a/numpy/core/src/multiarray/iterators.c b/numpy/core/src/multiarray/iterators.c
-index 9da811f69..ee9aa4b1c 100644
+index 9da811f69..6aa22befd 100644
 --- a/numpy/core/src/multiarray/iterators.c
 +++ b/numpy/core/src/multiarray/iterators.c
-@@ -1153,6 +1153,17 @@ NPY_NO_EXPORT PyTypeObject PyArrayIter_Type = {
+@@ -1153,6 +1153,23 @@ NPY_NO_EXPORT PyTypeObject PyArrayIter_Type = {
  
  /** END of Array Iterator **/
  
@@ -48,36 +48,24 @@ index 9da811f69..ee9aa4b1c 100644
 +    for (i = 0, nd = 0; i < mit->numiter; i++) {
 +        nd = PyArray_MAX(nd, PyArray_NDIM(mit->iters[i]->ao));
 +    }
-+    return nd
++    return nd;
++}
++
++__attribute__((noinline))
++NPY_NO_EXPORT PyArrayIterObject*
++PyArray_Broadcast_GetIterObj(PyArrayMultiIterObject *mit, int i){
++    return mit->iters[i];
 +}
 +
  /* Adjust dimensionality and strides for index object iterators
     --- i.e. broadcast
  */
-@@ -1163,18 +1174,20 @@ PyArray_Broadcast(PyArrayMultiIterObject *mit)
-     int i, nd, k, j;
-     npy_intp tmp;
-     PyArrayIterObject *it;
-+    PyArrayIterObject **it_ptr;
- 
--    /* Discover the broadcast number of dimensions */
--    for (i = 0, nd = 0; i < mit->numiter; i++) {
--        nd = PyArray_MAX(nd, PyArray_NDIM(mit->iters[i]->ao));
--    }
-+    nd = PyArray_Broadcast_GetNd(mit);
-     mit->nd = nd;
- 
-     /* Discover the broadcast shape in each dimension */
+@@ -1174,7 +1191,7 @@ PyArray_Broadcast(PyArrayMultiIterObject *mit)
      for (i = 0; i < nd; i++) {
          mit->dimensions[i] = 1;
--        for (j = 0; j < mit->numiter; j++) {
+         for (j = 0; j < mit->numiter; j++) {
 -            it = mit->iters[j];
-+    }
-+
-+    it_ptr = &mit->iters[0];
-+    for (j = 0; j < mit->numiter; j++, it_ptr++) {
-+        it = *it_ptr;
-+        for (i = 0; i < nd; i++) {
++            it = PyArray_Broadcast_GetIterObj(mit, i);
              /* This prepends 1 to shapes not already equal to nd */
              k = i + PyArray_NDIM(it->ao) - nd;
              if (k >= 0) {
