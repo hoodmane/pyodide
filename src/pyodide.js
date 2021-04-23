@@ -253,8 +253,10 @@ globalThis.loadPyodide = async function(config = {}) {
 
     // We have to invalidate Python's import caches, or it won't
     // see the new files.
-    Module.runPythonSimple('import importlib\n' +
-                           'importlib.invalidate_caches()\n');
+    Module.runPythonLocals(`
+      import importlib
+      importlib.invalidate_caches()
+    `);
   };
 
   // This is a promise that is resolved iff there are no pending package loads.
@@ -388,8 +390,10 @@ globalThis.loadPyodide = async function(config = {}) {
     if (recursionLimit > 1000) {
       recursionLimit = 1000;
     }
-    pyodide.runPythonSimple(
-        `import sys; sys.setrecursionlimit(int(${recursionLimit}))`);
+    Module.runPythonLocals(`
+      import sys
+      sys.setrecursionlimit(int(${recursionLimit}))
+    `);
   };
 
   ////////////////////////////////////////////////////////////
@@ -594,6 +598,15 @@ globalThis.loadPyodide = async function(config = {}) {
     return Module.pyodide_py.eval_code(code, globals);
   };
 
+  Module.runPythonLocals = function(code) {
+    let ns = Module.globals.get("dict")();
+    try {
+      return Module.pyodide_py.eval_code(code, ns);
+    } finally {
+      ns.destroy();
+    }
+  };
+
   // clang-format off
   /**
    * Inspect a Python code chunk and use :js:func:`pyodide.loadPackage` to
@@ -626,6 +639,18 @@ globalThis.loadPyodide = async function(config = {}) {
     for (let name of imports) {
       if (name in packageNames) {
         packages.add(packageNames[name]);
+      } else {
+        if(errorCallback){
+          let found = Module.runPythonLocals(`
+            try:
+              import ${name}
+              found = True
+            except ModuleNotFoundError:
+              found = False
+            found
+          `);
+          errorCallback(`Skipping unknown package '${name}'`);
+        }
       }
     }
     if (packages.size) {

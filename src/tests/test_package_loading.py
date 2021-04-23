@@ -123,6 +123,20 @@ def test_load_handle_failure(selenium_standalone):
     assert "Loading pyparsing" in selenium.logs
 
 
+def test_load_from_imports_failure(selenium):
+    msg = selenium.run_js(
+        """
+        await pyodide.loadPackagesFromImports(
+            "import pytz2",
+            undefined,
+            (msg) => { window.msg = msg }
+        );
+        return window.msg;
+        """
+    )
+    assert msg == "Skipping unknown package 'pytz2'"
+
+
 def test_load_failure_retry(selenium_standalone):
     """Check that a package can be loaded after failing to load previously"""
     selenium = selenium_standalone

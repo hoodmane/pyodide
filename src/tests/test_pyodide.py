@@ -50,14 +50,15 @@ def test_code_runner():
 
 
 def test_eval_code():
+    eval_code("")
     ns = {}
     assert (
         eval_code(
             """
-        def f(x):
-            return 2*x + 5
-        f(77)
-    """,
+            def f(x):
+                return 2*x + 5
+            f(77)
+            """,
             ns,
         )
         == 2 * 77 + 5
