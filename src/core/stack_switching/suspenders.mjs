@@ -16,13 +16,10 @@ import { StackState } from "./stack_state.mjs";
 function save_state() {
   const stackState = new StackState();
   const threadState = _captureThreadState();
-  const origCframe = Module.origCframe;
-  _restore_cframe(origCframe);
   return {
     threadState,
     stackState,
     suspender: suspenderGlobal.value,
-    origCframe,
   };
 }
 
@@ -87,8 +84,6 @@ export function promisingApply(...args) {
   validSuspender.value = true;
   // Record the current stack position. Used in stack_state.mjs
   Module.stackStop = stackSave();
-  // Subtle cframe shenanigans...
-  Module.origCframe = _get_cframe();
   return promisingApplyHandler(...args);
 }
 

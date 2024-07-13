@@ -1,7 +1,7 @@
 #include "Python.h"
 #include "emscripten.h"
 #include "error_handling.h"
-#include "internal/pycore_frame.h"
+#include "missing_python.h"
 
 // This file manages the Python stack / thread state when stack switching.
 //
@@ -116,9 +116,6 @@ typedef struct
   PyThreadState* ts;
 } ThreadState;
 
-PyThreadState *
-_PyThreadState_SwapNoGIL(PyThreadState *newts);
-
 
 EMSCRIPTEN_KEEPALIVE ThreadState*
 captureThreadState()
@@ -126,7 +123,7 @@ captureThreadState()
   ThreadState* res = malloc(sizeof(ThreadState));
   res->as = saveAsyncioState();
   PyThreadState* interp = PyThreadState_New(PyInterpreterState_Get());
-  res->ts = _PyThreadState_SwapNoGIL(interp);
+  res->ts = PyThreadState_Swap(interp);
   
   PyObject* _asyncio_module = NULL;
   PyObject* t = NULL;
@@ -143,61 +140,7 @@ EMSCRIPTEN_KEEPALIVE void
 restoreThreadState(ThreadState* state)
 {
    restoreAsyncioState(state->as);
-   PyThreadState* res = _PyThreadState_SwapNoGIL(state->ts);
+   PyThreadState* res = PyThreadState_Swap(state->ts);
    PyThreadState_Delete(res);
 }
 
-EMSCRIPTEN_KEEPALIVE int size_of_cframe = sizeof(_PyCFrame);
-
-EMSCRIPTEN_KEEPALIVE _PyCFrame*
-get_cframe()
-{
-  PyThreadState* tstate = PyThreadState_Get();
-  return tstate->cframe;
-}
-
-EMSCRIPTEN_KEEPALIVE void
-restore_cframe(_PyCFrame* frame)
-{
-  PyThreadState* tstate = PyThreadState_Get();
-  tstate->cframe = frame;
-}
-
-EMSCRIPTEN_KEEPALIVE void
-set_new_cframe(_PyCFrame* frame)
-{
-  PyThreadState* tstate = PyThreadState_Get();
-  *frame = *tstate->cframe;
-  tstate->cframe = frame;
-  tstate->cframe->previous = &PyThreadState_GET()->root_cframe;
-  tstate->cframe->current_frame = NULL;
-  tstate->trash.delete_nesting = 0;
-  tstate->py_recursion_remaining = tstate->py_recursion_limit;
-  tstate->c_recursion_remaining = C_RECURSION_LIMIT;
-}
-
-EMSCRIPTEN_KEEPALIVE void
-exit_cframe(_PyCFrame* frame)
-{
-  PyThreadState* tstate = PyThreadState_Get();
-  _PyStackChunk* chunk = tstate->datastack_chunk;
-
-  PyObjectArenaAllocator alloc;
-  PyObject_GetArenaAllocator(&alloc);
-
-  tstate->cframe = frame;
-  tstate->datastack_chunk = NULL;
-  tstate->datastack_top = NULL;
-  tstate->datastack_limit = NULL;
-
-  if (!alloc.free) {
-    return;
-  }
-
-  while (chunk) {
-    _PyStackChunk* prev = chunk->previous;
-    chunk->previous = NULL;
-    alloc.free(alloc.ctx, chunk, chunk->size);
-    chunk = prev;
-  }
-}
