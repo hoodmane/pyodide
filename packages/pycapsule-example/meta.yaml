@@ -1,0 +1,7 @@
+package:
+  name: pycapsule-example
+  version: "0.1"
+  top-level:
+    - pycapsule_example
+source:
+  path: pycapsule-example
