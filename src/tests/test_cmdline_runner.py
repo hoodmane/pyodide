@@ -161,7 +161,7 @@ Try `python -h' for more information.
 
 
 @only_node
-def test_extra_mounts(selenium, tmp_path, monkeypatch):
+def test_tmp_directories(selenium, tmp_path, monkeypatch):
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"
     dir_a.mkdir()
@@ -171,7 +171,6 @@ def test_extra_mounts(selenium, tmp_path, monkeypatch):
     tmp_path_b = dir_b / "script.py"
     tmp_path_a.write_text("print('hello 1')")
     tmp_path_b.write_text("print('hello 2')")
-    monkeypatch.setenv("_PYODIDE_EXTRA_MOUNTS", f"{dir_a}:{dir_b}")
     result = subprocess.run(
         [script_path, tmp_path_a], capture_output=True, encoding="utf8", check=False
     )
