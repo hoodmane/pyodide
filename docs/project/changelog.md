@@ -18,6 +18,8 @@ myst:
 
 _Insert Date Here_
 
+- {{ Fix }} Replaced uses of the deprecated `File.lastModifiedDate` property. {pr}`5426`
+
 ### `python` CLI entrypoint
 
 - {{ Enhancement }} The `python` CLI will pass the contents of the `NODEFLAGS`
