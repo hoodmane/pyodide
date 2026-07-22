@@ -1,0 +1,148 @@
+From 7879c6267de6f000c51889a99f8d3ad01bd4ca50 Mon Sep 17 00:00:00 2001
+From: Hood Chatham <roberthoodchatham@gmail.com>
+Date: Tue, 21 Jul 2026 10:49:58 +0200
+Subject: [PATCH 5/5] Partial revert of "Enable real dynamic linking with
+ `-shared` by default (#25930)"
+
+This reverts commit bbc19e213e4c182efe1a1b5cdbb03ccf8c60fc45.
+---
+ cmake/Modules/Platform/Emscripten.cmake |  9 +--------
+ tools/building.py                       | 16 ++++++----------
+ tools/cmdline.py                        |  3 ++-
+ tools/link.py                           | 13 +++++++++----
+ 4 files changed, 18 insertions(+), 23 deletions(-)
+
+diff --git a/cmake/Modules/Platform/Emscripten.cmake b/cmake/Modules/Platform/Emscripten.cmake
+index 087dab489..d4cb39f9c 100644
+--- a/cmake/Modules/Platform/Emscripten.cmake
++++ b/cmake/Modules/Platform/Emscripten.cmake
+@@ -18,14 +18,7 @@ set(CMAKE_SYSTEM_NAME Emscripten)
+ set(CMAKE_SYSTEM_VERSION 1)
+ 
+ set(CMAKE_CROSSCOMPILING TRUE)
+-
+-# Certain cmake versions are not compatible with dynnamic linking due to
+-# https://gitlab.kitware.com/cmake/cmake/-/work_items/27240
+-if (("${CMAKE_VERSION}" VERSION_GREATER_EQUAL "4.2.0" AND "${CMAKE_VERSION}" VERSION_LESS "4.2.6") OR
+-    ("${CMAKE_VERSION}" VERSION_GREATER_EQUAL "4.3.0" AND "${CMAKE_VERSION}" VERSION_LESS "4.3.3"))
+-  message(WARNING "This version of cmake (${CMAKE_VERSION}) does not support emscripten shared libraries.  Use cmake < 4.2.0 or cmake > 4.3.3 if you need shared library support")
+-  set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
+-endif()
++set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
+ 
+ # Advertise Emscripten as a 32-bit platform (as opposed to
+ # CMAKE_SYSTEM_PROCESSOR=x86_64 for 64-bit platform), since some projects (e.g.
+diff --git a/tools/building.py b/tools/building.py
+index ce88d3031..62ade5545 100644
+--- a/tools/building.py
++++ b/tools/building.py
+@@ -72,7 +72,7 @@ def get_building_env():
+   env['AR'] = EMAR
+   env['LD'] = EMCC
+   env['NM'] = LLVM_NM
+-  env['LDSHARED'] = f'{EMCC} -shared'
++  env['LDSHARED'] = EMCC
+   env['RANLIB'] = EMRANLIB
+   env['EMSCRIPTEN_TOOLS'] = path_from_root('tools')
+   env['HOST_CC'] = CLANG_CC
+@@ -165,12 +165,6 @@ def lld_flags_for_executable(external_symbols):
+     stub = create_stub_object(external_symbols)
+     cmd.append(stub)
+ 
+-  if settings.FAKE_DYLIBS or (not settings.MAIN_MODULE and not settings.SIDE_MODULE):
+-    cmd.append('-Bstatic')
+-  else:
+-    # wasm-ld still defaults to static linking by default. If that ever changes, we can remove this line.
+-    cmd.append('-Bdynamic')
+-
+   if not settings.ERROR_ON_UNDEFINED_SYMBOLS:
+     cmd.append('--import-undefined')
+ 
+@@ -190,6 +184,9 @@ def lld_flags_for_executable(external_symbols):
+       not settings.ASYNCIFY):
+     cmd.append('--strip-debug')
+ 
++  if settings.LINKABLE:
++    cmd.append('--export-dynamic')
++
+   if settings.LTO and not settings.EXIT_RUNTIME:
+     # The WebAssembly backend can generate new references to `__cxa_atexit` at
+     # LTO time.  This `-u` flag forces the `__cxa_atexit` symbol to be
+@@ -206,6 +203,7 @@ def lld_flags_for_executable(external_symbols):
+   c_exports = [e for e in c_exports if e not in external_symbols]
+   c_exports += settings.REQUIRED_EXPORTS
+   if settings.MAIN_MODULE:
++    cmd.append('-Bdynamic')
+     c_exports += side_module_external_deps(external_symbols)
+   for export in c_exports:
+     if settings.ERROR_ON_UNDEFINED_SYMBOLS:
+@@ -229,8 +227,6 @@ def lld_flags_for_executable(external_symbols):
+     if not settings.LINKABLE:
+       cmd.append('--no-export-dynamic')
+   else:
+-    if settings.LINKABLE:
+-      cmd.append('--export-dynamic')
+     cmd.append('--export-table')
+     if settings.ALLOW_TABLE_GROWTH:
+       cmd.append('--growable-table')
+@@ -306,7 +302,7 @@ def lld_flags(args, linker_inputs=None):
+ 
+   # Emscripten currently expects linkable output (SIDE_MODULE/MAIN_MODULE) to
+   # include all archive contents.
+-  if settings.LINKABLE and (settings.FAKE_DYLIBS or not settings.SIDE_MODULE):
++  if settings.LINKABLE:
+     args.insert(0, '--whole-archive')
+     args.append('--no-whole-archive')
+ 
+diff --git a/tools/cmdline.py b/tools/cmdline.py
+index 4b38e18ea..6dbb50305 100644
+--- a/tools/cmdline.py
++++ b/tools/cmdline.py
+@@ -57,7 +57,8 @@ logger = logging.getLogger('args')
+ 
+ @unique
+ class OFormat(Enum):
+-  # Output a relocatable object file. i.e. `-r` linker flag
++  # Output a relocatable object file.  We use this
++  # today for `-r` and `-shared`.
+   OBJECT = auto()
+   WASM = auto()
+   JS = auto()
+diff --git a/tools/link.py b/tools/link.py
+index 0a01e7544..6fa6eb015 100644
+--- a/tools/link.py
++++ b/tools/link.py
+@@ -820,14 +820,17 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
+ 
+   apply_library_settings(linker_args)
+ 
++  if settings.SIDE_MODULE or settings.MAIN_MODULE:
++    default_setting('FAKE_DYLIBS', 0)
++
+   if options.shared and not settings.FAKE_DYLIBS:
+     default_setting('SIDE_MODULE', 1)
+ 
+-  if not settings.SIDE_MODULE and not settings.FAKE_DYLIBS:
++  if not settings.FAKE_DYLIBS:
+     options.dylibs = get_dylibs(options, linker_args)
+-    # If there are any dynamic libraries on the command line then enable
+-    # `MAIN_MODULE` by default in order to produce JS code that can load them.
+-    if options.dylibs and not settings.MAIN_MODULE:
++    # If there are any dynamically linked libraries on the command line then
++    # need to enable `MAIN_MODULE` in order to produce JS code that can load them.
++    if not settings.MAIN_MODULE and not settings.SIDE_MODULE and options.dylibs:
+       default_setting('MAIN_MODULE', 2)
+ 
+   linker_args += calc_extra_ldflags(options)
+@@ -929,6 +932,8 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
+     if final_suffix in EXECUTABLE_EXTENSIONS:
+       diagnostics.warning('emcc', '-shared/-r used with executable output suffix. This behaviour is deprecated.  Please remove -shared/-r to build an executable or avoid the executable suffix (%s) when building object files.' % final_suffix)
+     else:
++      if options.shared and 'FAKE_DYLIBS' not in user_settings:
++        diagnostics.warning('emcc', 'linking a library with `-shared` will emit a static object file (FAKE_DYLIBS defaults to true).  If you want to build a runtime shared library use the SIDE_MODULE or FAKE_DYLIBS=0.')
+       options.oformat = OFormat.OBJECT
+ 
+   if not options.oformat:
+-- 
+2.54.0
+
