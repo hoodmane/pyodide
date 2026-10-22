@@ -8,8 +8,12 @@ Status: prototyped and tested. Branches:
 
 - CPython: `execstack-3.14` (worktree `~/cpython-execstack`, off `v3.14.2`).
   `Python/execstack.c`, `Include/cpython/pystate.h`, tests in
-  `Lib/test/test_capi/test_execstack.py` driven by a ucontext fiber in
-  `Modules/_testcapi/execstack.c`. 27 tests, refleak-clean (`-R 3:3`).
+  `Lib/test/test_capi/test_execstack.py` driven by a greenlet-like fiber in
+  `Modules/_testcapi/execstack.c` (x86-64 glibc): all fibers share one C
+  stack region, suspended slices are spilled to the heap and the region is
+  poisoned, so suspended entry frames are guaranteed garbage. Disabling the
+  entry-frame unlinking segfaults the suite. 30 tests, refleak-clean
+  (`-R 3:3`).
 - greenlet: `execstack-api`. Full suite against the patched debug 3.14
   matches the baseline built with the API disabled (`-DGREENLET_NO_EXECSTACK`);
   one known leak (`fails_leakcheck_on_py314_or_less`) is fixed.
