@@ -8,11 +8,14 @@ Status: prototyped and tested. Branches:
 
 - CPython: `execstack-3.14` (worktree `~/cpython-execstack`, off `v3.14.2`).
   `Python/execstack.c`, `Include/cpython/pystate.h`, tests in
-  `Lib/test/test_capi/test_execstack.py` driven by a ucontext fiber in
-  `Modules/_testcapi/execstack.c`. 27 tests, refleak-clean (`-R 3:3`).
-- greenlet: `execstack-api`. Full suite against the patched debug 3.14
-  matches the baseline built with the API disabled (`-DGREENLET_NO_EXECSTACK`);
-  one known leak (`fails_leakcheck_on_py314_or_less`) is fixed.
+  `Lib/test/test_capi/test_execstack.py` driven by a greenlet-like fiber in
+  `Modules/_testcapi/execstack.c` (x86-64 glibc): all fibers share one C
+  stack region, suspended slices are spilled to the heap and the region is
+  poisoned, so suspended entry frames are guaranteed garbage. Disabling the
+  entry-frame unlinking segfaults the suite. 30 tests, refleak-clean
+  (`-R 3:3`).
+- [greenlet](https://github.com/python-greenlet/greenlet/compare/master...hoodmane:execstack-api):
+  Full testsuite is passing.
 - Pyodide: `execstack-api`. Carries the CPython change as
   `cpython/patches/0010-Add-PyUnstable_ExecStack-API.patch`;
   `pystate_pycore.c` is deleted. `test_stack_switching.py` passes on node
@@ -27,10 +30,10 @@ Both greenlet (`src/greenlet/TPythonState.cpp`, `TExceptionState.cpp`) and
 Pyodide (`src/core/stack_switching/pystate.c`, `pystate_pycore.c`) implement
 stackful coroutines by treating `PyThreadState` as two halves:
 
-- a *thread-wide* half (GIL/attach state, `interp`, `dict`, trace/profile
+- a _thread-wide_ half (GIL/attach state, `interp`, `dict`, trace/profile
   functions, `async_gen_*`, thread ids, `threading_local_*`, the asyncio
   running loop, ...), and
-- a *per-execution-stack* half that must travel with a coroutine.
+- a _per-execution-stack_ half that must travel with a coroutine.
 
 Each library swaps the second half by poking `PyThreadState` fields directly,
 several of which live in `_PyThreadStateImpl` or require internal headers.
@@ -39,29 +42,30 @@ reason, and greenlet's version is a ladder of `#if GREENLET_PY3xx`.
 
 Mark Shannon's abandoned [gh-32303](https://github.com/python/cpython/pull/32303)
 covered only the datastack. His objection to a separate save/restore pair --
-"too many states and error conditions" -- argues for an atomic *swap* model.
+"too many states and error conditions" -- argues for an atomic _swap_ model.
 Pyodide already uses one (`captureTaskState` / `restoreTaskState` each do
 save+load in one step).
+==+
 
 ## What the two consumers actually do to `tstate`
 
-| Field | greenlet | Pyodide | Notes |
-|---|---|---|---|
-| `context` + `context_ver++` | yes | yes | strong ref |
-| `current_frame` | yes | yes | |
-| `datastack_chunk/top/limit` | yes; frees root chunk via arena allocator in `did_finish` | yes; frees via `_PyObject_VirtualFree` (internal header) | new stack starts `NULL`; someone must free the lazily created root chunk |
-| `exc_info` / `exc_state` | yes, `NULL` sentinel when `exc_info == &tstate->exc_state` | same trick | |
-| `py_recursion_remaining` | as depth (`limit - remaining`) | as remaining | depth is robust to `sys.setrecursionlimit` |
-| `delete_later` | yes, with a resurrecting INCREF | yes, borrowed | trashcan chain |
-| `current_executor` | yes | yes | JIT; borrowed |
-| `tracing`, `what_event` | no | yes | |
-| `current_exception` | no (travels with control; this is how `throw` works) | yes (defensively zeroed) | |
-| `_PyThreadStateImpl.asyncio_running_task` | no | yes (internal header) | |
-| `critical_section` + `_PyCriticalSection_SuspendAll/Resume` | free-threaded only | n/a | internal |
-| `_PyThreadStateImpl.c_stack_refs` + strong-ref snapshot for GC | free-threaded only | n/a | internal |
-| top frame `stackpointer` | free-threaded 3.14 | no | |
-| frame-chain rewriting (`expose_frames` / `unexpose_frames`) | 3.12+, so `gr_frame` / `f_back` are safe while entry frames live on a spilled C stack | **not done** | Pyodide has the same latent hazard: `f_back` on a frame object captured by a suspended task walks `previous` through an entry frame on an evicted wasm shadow stack |
-| GC: `tp_traverse` of suspended frames (`_PyGC_VisitFrameStack`, `_Py_VISIT_STACKREF`), `tp_clear` (`PyStackRef_CLEAR` loop) | 3.15 | **not done** (refcounts only; cycles through suspended frames leak) | internal |
+| Field                                                                                                                       | greenlet                                                                              | Pyodide                                                             | Notes                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context` + `context_ver++`                                                                                                 | yes                                                                                   | yes                                                                 | strong ref                                                                                                                                                          |
+| `current_frame`                                                                                                             | yes                                                                                   | yes                                                                 |                                                                                                                                                                     |
+| `datastack_chunk/top/limit`                                                                                                 | yes; frees root chunk via arena allocator in `did_finish`                             | yes; frees via `_PyObject_VirtualFree` (internal header)            | new stack starts `NULL`; someone must free the lazily created root chunk                                                                                            |
+| `exc_info` / `exc_state`                                                                                                    | yes, `NULL` sentinel when `exc_info == &tstate->exc_state`                            | same trick                                                          |                                                                                                                                                                     |
+| `py_recursion_remaining`                                                                                                    | as depth (`limit - remaining`)                                                        | as remaining                                                        | depth is robust to `sys.setrecursionlimit`                                                                                                                          |
+| `delete_later`                                                                                                              | yes, with a resurrecting INCREF                                                       | yes, borrowed                                                       | trashcan chain                                                                                                                                                      |
+| `current_executor`                                                                                                          | yes                                                                                   | yes                                                                 | JIT; borrowed                                                                                                                                                       |
+| `tracing`, `what_event`                                                                                                     | no                                                                                    | yes                                                                 |                                                                                                                                                                     |
+| `current_exception`                                                                                                         | no (travels with control; this is how `throw` works)                                  | yes (defensively zeroed)                                            |                                                                                                                                                                     |
+| `_PyThreadStateImpl.asyncio_running_task`                                                                                   | no                                                                                    | yes (internal header)                                               |                                                                                                                                                                     |
+| `critical_section` + `_PyCriticalSection_SuspendAll/Resume`                                                                 | free-threaded only                                                                    | n/a                                                                 | internal                                                                                                                                                            |
+| `_PyThreadStateImpl.c_stack_refs` + strong-ref snapshot for GC                                                              | free-threaded only                                                                    | n/a                                                                 | internal                                                                                                                                                            |
+| top frame `stackpointer`                                                                                                    | free-threaded 3.14                                                                    | no                                                                  |                                                                                                                                                                     |
+| frame-chain rewriting (`expose_frames` / `unexpose_frames`)                                                                 | 3.12+, so `gr_frame` / `f_back` are safe while entry frames live on a spilled C stack | **not done**                                                        | Pyodide has the same latent hazard: `f_back` on a frame object captured by a suspended task walks `previous` through an entry frame on an evicted wasm shadow stack |
+| GC: `tp_traverse` of suspended frames (`_PyGC_VisitFrameStack`, `_Py_VISIT_STACKREF`), `tp_clear` (`PyStackRef_CLEAR` loop) | 3.15                                                                                  | **not done** (refcounts only; cycles through suspended frames leak) | internal                                                                                                                                                            |
 
 Everything marked "internal" is a release-to-release hazard for both
 libraries.
@@ -69,7 +73,7 @@ libraries.
 ## The API
 
 An opaque heap object representing one execution stack (the per-coroutine
-half). Each `PyThreadState` has exactly one *running* `ExecStack` at any time;
+half). Each `PyThreadState` has exactly one _running_ `ExecStack` at any time;
 every other stack is `NEW` or `SUSPENDED`. The one operation that mutates the
 thread state is an atomic swap.
 
@@ -169,7 +173,7 @@ Per-stack (swapped by `Switch`): `current_frame`, `datastack_*`,
 `what_event`, `critical_section` (with suspend/resume), `c_stack_refs`,
 `asyncio_running_task`.
 
-Travels with control (deliberately *not* swapped): `current_exception`. This
+Travels with control (deliberately _not_ swapped): `current_exception`. This
 is how a library throws into a stack -- `PyErr_SetRaisedException(exc);
 Switch(target)` -- and it is what greenlet relies on today. Pyodide's
 defensive zeroing becomes an assertion.
@@ -206,7 +210,7 @@ Pyodide both run on slices of the thread's own stack.
   link `f_back`.
 - **GC model = suspended generator.** A `SUSPENDED` stack is owned by its
   library object and traversed via that object's `tp_traverse`, so cycles
-  through it are collectable. It is *not* registered as a thread-stack root
+  through it are collectable. It is _not_ registered as a thread-stack root
   (that would pin everything a suspended coroutine references). On
   free-threaded builds the C-stack refs that were live at suspension are
   snapshotted as strong references, as greenlet does.
