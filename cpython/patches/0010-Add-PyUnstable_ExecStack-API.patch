@@ -193,22 +193,33 @@ index 905ea4aa2e5..75a0f419fe3 100644
  @MODULE__TESTCLINIC_LIMITED_TRUE@_testclinic_limited _testclinic_limited.c
 diff --git a/Modules/_testcapi/execstack.c b/Modules/_testcapi/execstack.c
 new file mode 100644
-index 00000000000..6111fcef201
+index 00000000000..5dd4f3ff472
 --- /dev/null
 +++ b/Modules/_testcapi/execstack.c
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,673 @@
 +/* Tests for the PyUnstable_ExecStack API.
 + *
-+ * To exercise the API realistically we implement a minimal stackful
-+ * coroutine ("Fiber") on top of POSIX ucontext: each fiber runs Python code
-+ * on its own C stack and its own execution stack. This mirrors what greenlet
-+ * and Pyodide do, including the entry frames that the eval loop keeps on the
-+ * C stack between Python frames.
++ * To exercise the API the way greenlet does, this file implements a minimal
++ * stackful coroutine ("Fiber") that shares one C stack region between all
++ * fibers of a thread, the way greenlet shares the thread's own stack:
 + *
-+ * The fibers use the split Suspend()/Resume() protocol that a library which
-+ * copies C stacks around (greenlet) needs: the side that is about to go away
-+ * calls Suspend() while its C stack is still intact, the C stacks are
-+ * swapped, and the side that wakes up calls Resume() for its own stack.
++ *  - Every fiber runs on the same region. While a fiber runs, the C stack of
++ *    every suspended fiber has been copied to the heap, and the region is
++ *    filled with a poison byte before the incoming fiber's slice is copied
++ *    back in. So the entry frames that the eval loop keeps on the C stack of
++ *    a suspended fiber are guaranteed to be garbage: anything in the
++ *    interpreter that follows them (f_back, GC traversal, ...) would crash
++ *    if the ExecStack API did not unlink them.
++ *
++ *  - The switch itself is done by a trampoline running on a separate scratch
++ *    stack (so it can overwrite the region freely); the register save and
++ *    restore is left to ucontext, and the stack pointer of a suspended
++ *    fiber is read out of its ucontext_t. That is the only platform specific
++ *    part, so this is only built for x86-64 glibc.
++ *
++ *  - The split Suspend()/Resume() protocol is therefore not just exercised
++ *    but required: Suspend() runs before the outgoing C stack is destroyed
++ *    and Resume() after the incoming one has been restored.
 + */
 +
 +#include "parts.h"
@@ -216,7 +227,7 @@ index 00000000000..6111fcef201
 +
 +#include "frameobject.h"
 +
-+#if defined(__linux__)
++#if defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
 +#  define HAVE_FIBER_TEST 1
 +#  include <ucontext.h>
 +#  include <sys/mman.h>
@@ -224,55 +235,204 @@ index 00000000000..6111fcef201
 +
 +#ifdef HAVE_FIBER_TEST
 +
-+#define FIBER_STACK_SIZE (1024 * 1024)
++// The region shared by all fibers of a thread, and the scratch stack the
++// trampoline runs on. Both are mapped lazily per thread and never unmapped
++// (this is a test).
++#define REGION_SIZE (1024 * 1024)
++#define SCRATCH_SIZE (64 * 1024)
++// Bytes below the saved stack pointer that we save and restore too: the
++// System V red zone, plus room for setcontext() to push the return address.
++#define SP_SLACK 256
++#define POISON 0xAB
 +
 +typedef struct FiberObject {
 +    PyObject_HEAD
 +    PyUnstable_ExecStack *stack;
-+    PyUnstable_ExecStack *parent_stack;   // stack that last switched into us
-+    struct FiberObject *parent_fiber;     // NULL if that was the root
-+    ucontext_t ctx;
-+    ucontext_t parent_ctx;
-+    void *c_stack;
++    PyThreadState *tstate;              // thread we run on, once started
++    struct FiberObject *parent;         // who switched into us; NULL = root
++    ucontext_t ctx;                     // registers while suspended
++    char *saved;                        // heap copy of [sp - SP_SLACK, end)
++    size_t saved_size;
++    size_t saved_capacity;
 +    PyObject *run;
 +    PyObject *transfer;   // value passed across a switch; NULL + error = throw
 +    int started;
 +    int finished;
 +} FiberObject;
 +
-+// The fiber currently executing on this (test) thread, NULL for the root.
-+// The tests are single threaded apart from one that exits a thread with a
-+// suspended fiber, which never runs concurrently with the others.
-+static FiberObject *current_fiber = NULL;
-+static FiberObject *starting_fiber = NULL;
++// Per-thread switching state. NULL fiber means "the root", i.e. the thread's
++// own C stack, which is outside the region and so never overwritten.
++static _Thread_local char *region = NULL;
++static _Thread_local char *scratch = NULL;
++static _Thread_local FiberObject *current = NULL;
++static _Thread_local FiberObject *switch_from = NULL;
++static _Thread_local FiberObject *switch_to = NULL;
++static _Thread_local ucontext_t root_ctx;
++static _Thread_local ucontext_t trampoline_ctx;
++static _Thread_local PyUnstable_ExecStack *root_exec_stack = NULL;
 +
-+static void
-+apply_stack_protection(PyThreadState *tstate, FiberObject *fiber)
++static inline char *
++region_end(void)
 +{
-+    if (fiber == NULL) {
-+        PyUnstable_ThreadState_ResetStackProtection(tstate);
-+    }
-+    else {
-+        if (PyUnstable_ThreadState_SetStackProtection(tstate, fiber->c_stack,
-+                                                      FIBER_STACK_SIZE) < 0) {
-+            Py_FatalError("SetStackProtection failed");
-+        }
-+    }
++    return region + REGION_SIZE;
 +}
 +
-+// Runs on the fiber's own C stack.
-+static void
-+fiber_entry(void)
++static int
++ensure_region(void)
 +{
-+    FiberObject *self = starting_fiber;
-+    starting_fiber = NULL;
++    if (region != NULL) {
++        return 0;
++    }
++    region = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE,
++                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (region == MAP_FAILED) {
++        region = NULL;
++        PyErr_NoMemory();
++        return -1;
++    }
++    scratch = mmap(NULL, SCRATCH_SIZE, PROT_READ | PROT_WRITE,
++                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (scratch == MAP_FAILED) {
++        scratch = NULL;
++        PyErr_NoMemory();
++        return -1;
++    }
++    return 0;
++}
++
++static inline char *
++ctx_sp(const ucontext_t *ctx)
++{
++    return (char *)ctx->uc_mcontext.gregs[REG_RSP];
++}
++
++// Where a fiber's live slice of the region starts, given its saved context.
++static inline char *
++slice_start(const FiberObject *fiber)
++{
++    char *sp = ctx_sp(&fiber->ctx) - SP_SLACK;
++    assert(sp >= region && sp < region_end());
++    return sp;
++}
++
++/* The trampoline: runs on the scratch stack, so it may clobber the region. */
++static void
++trampoline(void)
++{
++    FiberObject *from = switch_from;
++    FiberObject *to = switch_to;
 +    PyThreadState *tstate = PyThreadState_Get();
 +
-+    // The parent suspended its stack before switching to us.
-+    if (PyUnstable_ExecStack_Resume(tstate, self->stack) < 0) {
-+        Py_FatalError("PyUnstable_ExecStack_Resume failed in fiber_entry");
++    if (from != NULL) {
++        // Spill the outgoing fiber's stack. The capacity was reserved before
++        // we got here, so this cannot fail.
++        char *start = slice_start(from);
++        from->saved_size = (size_t)(region_end() - start);
++        if (from->saved_size > from->saved_capacity) {
++            Py_FatalError("fiber: saved stack capacity too small");
++        }
++        memcpy(from->saved, start, from->saved_size);
 +    }
-+    apply_stack_protection(tstate, self);
++
++    // Make sure nothing can rely on a suspended fiber's C stack.
++    memset(region, POISON, REGION_SIZE);
++
++    if (to == NULL) {
++        PyUnstable_ThreadState_ResetStackProtection(tstate);
++        setcontext(&root_ctx);
++    }
++    else {
++        if (PyUnstable_ThreadState_SetStackProtection(tstate, region,
++                                                      REGION_SIZE) < 0) {
++            Py_FatalError("fiber: SetStackProtection failed");
++        }
++        if (to->started) {
++            memcpy(slice_start(to), to->saved, to->saved_size);
++            to->saved_size = 0;
++        }
++        else {
++            // First switch into `to`: start it at the top of the region,
++            // right where everybody else's frames used to be.
++            to->started = 1;
++            getcontext(&to->ctx);
++            to->ctx.uc_stack.ss_sp = region;
++            to->ctx.uc_stack.ss_size = REGION_SIZE;
++            to->ctx.uc_link = NULL;
++            extern void fiber_entry(void);
++            makecontext(&to->ctx, fiber_entry, 0);
++        }
++        setcontext(&to->ctx);
++    }
++    Py_FatalError("fiber: setcontext returned");
++}
++
++/* Transfer control from the current fiber (or the root) to `to` (or the
++ * root). Returns -1 with an exception set, and nothing changed, if the
++ * execution stack could not be suspended. Otherwise returns 0 in the
++ * original fiber once something switches back to it, with its execution
++ * stack resumed. */
++static int
++jump(FiberObject *to)
++{
++    PyThreadState *tstate = PyThreadState_Get();
++    FiberObject *from = current;
++
++    if (from != NULL) {
++        // Reserve room for our stack slice now, while allocation is still
++        // allowed. `marker` is above the stack pointer swapcontext() will
++        // record, so this over-estimates.
++        volatile char marker;
++        size_t need = (size_t)(region_end() - (char *)&marker) + SP_SLACK + 4096;
++        if (need > from->saved_capacity) {
++            char *buf = PyMem_RawRealloc(from->saved, need);
++            if (buf == NULL) {
++                PyErr_NoMemory();
++                return -1;
++            }
++            from->saved = buf;
++            from->saved_capacity = need;
++        }
++    }
++
++    // Save the Python side of our stack while our C stack is still intact.
++    PyUnstable_ExecStack *mine = PyUnstable_ExecStack_Suspend(tstate);
++    if (mine == NULL) {
++        return -1;
++    }
++    if (from == NULL) {
++        root_exec_stack = mine;
++    }
++
++    switch_from = from;
++    switch_to = to;
++    current = to;
++    getcontext(&trampoline_ctx);
++    trampoline_ctx.uc_stack.ss_sp = scratch;
++    trampoline_ctx.uc_stack.ss_size = SCRATCH_SIZE;
++    trampoline_ctx.uc_link = NULL;
++    makecontext(&trampoline_ctx, trampoline, 0);
++    swapcontext(from ? &from->ctx : &root_ctx, &trampoline_ctx);
++
++    // Somebody switched back to us. Our C stack has been restored, so locals
++    // are valid again, but follow greenlet's discipline and reload from
++    // thread-local state anyway. `current` was set to us by the switcher.
++    tstate = PyThreadState_Get();
++    mine = current ? current->stack : root_exec_stack;
++    if (PyUnstable_ExecStack_Resume(tstate, mine) < 0) {
++        Py_FatalError("fiber: PyUnstable_ExecStack_Resume failed after switch");
++    }
++    return 0;
++}
++
++// First function on a new fiber's stack. Never returns.
++void
++fiber_entry(void)
++{
++    FiberObject *self = current;
++    PyThreadState *tstate = PyThreadState_Get();
++    if (PyUnstable_ExecStack_Resume(tstate, self->stack) < 0) {
++        Py_FatalError("fiber: PyUnstable_ExecStack_Resume failed in entry");
++    }
 +
 +    PyObject *arg = self->transfer;
 +    self->transfer = NULL;
@@ -289,13 +449,10 @@ index 00000000000..6111fcef201
 +    }
 +    self->transfer = result;
 +    self->finished = 1;
-+
-+    if (PyUnstable_ExecStack_Suspend(tstate) == NULL) {
-+        Py_FatalError("PyUnstable_ExecStack_Suspend failed leaving fiber");
++    if (jump(self->parent) < 0) {
++        Py_FatalError("fiber: cannot leave a finished fiber");
 +    }
-+    apply_stack_protection(tstate, self->parent_fiber);
-+    // Returning jumps to ctx.uc_link == &self->parent_ctx; the parent
-+    // resumes its own stack there.
++    Py_FatalError("fiber: finished fiber was resumed");
 +}
 +
 +static PyObject *
@@ -307,40 +464,34 @@ index 00000000000..6111fcef201
 +        PyErr_SetString(PyExc_ValueError, "fiber has finished");
 +        return NULL;
 +    }
-+    if (self == current_fiber) {
++    if (self == current) {
 +        Py_XDECREF(value);
 +        PyErr_Clear();
 +        PyErr_SetString(PyExc_ValueError, "fiber is already running");
 +        return NULL;
 +    }
-+    assert(self->transfer == NULL);
 +    PyThreadState *tstate = PyThreadState_Get();
-+    PyUnstable_ExecStack *parent_stack = PyUnstable_ExecStack_Suspend(tstate);
-+    if (parent_stack == NULL) {
++    if (self->started && self->tstate != tstate) {
++        Py_XDECREF(value);
++        PyErr_Clear();
++        PyErr_SetString(PyExc_ValueError,
++                        "cannot switch to a fiber of another thread");
++        return NULL;
++    }
++    if (ensure_region() < 0) {
 +        Py_XDECREF(value);
 +        return NULL;
 +    }
++    assert(self->transfer == NULL);
 +    self->transfer = value;
-+    self->parent_stack = parent_stack;
-+    self->parent_fiber = current_fiber;
-+    current_fiber = self;
-+    if (!self->started) {
-+        self->started = 1;
-+        getcontext(&self->ctx);
-+        self->ctx.uc_stack.ss_sp = self->c_stack;
-+        self->ctx.uc_stack.ss_size = FIBER_STACK_SIZE;
-+        self->ctx.uc_link = &self->parent_ctx;
-+        makecontext(&self->ctx, fiber_entry, 0);
-+        starting_fiber = self;
++    self->tstate = tstate;
++    self->parent = current;
++    if (jump(self) < 0) {
++        self->transfer = NULL;
++        Py_XDECREF(value);
++        return NULL;
 +    }
-+    swapcontext(&self->parent_ctx, &self->ctx);
-+    // Back from the fiber, which suspended its own stack before switching.
-+    // (Can't use `parent_stack`: locals aren't trustworthy across a stack
-+    // switch in general, so follow the greenlet discipline and reload.)
-+    if (PyUnstable_ExecStack_Resume(tstate, self->parent_stack) < 0) {
-+        Py_FatalError("PyUnstable_ExecStack_Resume failed in fiber_switch");
-+    }
-+    current_fiber = self->parent_fiber;
++    // Back from the fiber: it finished or switched back to us.
 +    PyObject *result = self->transfer;
 +    self->transfer = NULL;
 +    assert((result == NULL) == (PyErr_Occurred() != NULL));
@@ -375,26 +526,17 @@ index 00000000000..6111fcef201
 +    if (!PyArg_ParseTuple(args, "|O", &value)) {
 +        return NULL;
 +    }
-+    if (self != current_fiber) {
++    if (self != current) {
 +        PyErr_SetString(PyExc_ValueError, "fiber is not running");
 +        return NULL;
 +    }
-+    PyThreadState *tstate = PyThreadState_Get();
 +    assert(self->transfer == NULL);
-+
-+    if (PyUnstable_ExecStack_Suspend(tstate) == NULL) {
++    self->transfer = Py_NewRef(value);
++    if (jump(self->parent) < 0) {
++        Py_CLEAR(self->transfer);
 +        return NULL;
 +    }
-+    self->transfer = Py_NewRef(value);
-+    apply_stack_protection(tstate, self->parent_fiber);
-+    swapcontext(&self->ctx, &self->parent_ctx);
-+
-+    // Resumed by fiber_switch_impl(), which suspended the parent's stack and
-+    // recorded it in self->parent_stack.
-+    if (PyUnstable_ExecStack_Resume(tstate, self->stack) < 0) {
-+        Py_FatalError("PyUnstable_ExecStack_Resume failed resuming fiber");
-+    }
-+    apply_stack_protection(tstate, self);
++    // Resumed by fiber_switch_impl() with a value, or thrown into.
 +    PyObject *result = self->transfer;
 +    self->transfer = NULL;
 +    return result;   // NULL with an exception set if thrown into
@@ -416,6 +558,15 @@ index 00000000000..6111fcef201
 +{
 +    FiberObject *self = (FiberObject *)op;
 +    return PyLong_FromLong(PyUnstable_ExecStack_GetState(self->stack));
++}
++
++// How many bytes of C stack are spilled to the heap right now: non-zero
++// exactly while the fiber is suspended (started and not running).
++static PyObject *
++fiber_get_saved_stack_size(PyObject *op, void *Py_UNUSED(closure))
++{
++    FiberObject *self = (FiberObject *)op;
++    return PyLong_FromSize_t(self->saved_size);
 +}
 +
 +static PyObject *
@@ -455,13 +606,6 @@ index 00000000000..6111fcef201
 +    if (self->stack == NULL) {
 +        Py_DECREF(self);
 +        return NULL;
-+    }
-+    self->c_stack = mmap(NULL, FIBER_STACK_SIZE, PROT_READ | PROT_WRITE,
-+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+    if (self->c_stack == MAP_FAILED) {
-+        self->c_stack = NULL;
-+        Py_DECREF(self);
-+        return PyErr_NoMemory();
 +    }
 +    return (PyObject *)self;
 +}
@@ -508,9 +652,7 @@ index 00000000000..6111fcef201
 +            PyErr_FormatUnraisable("Exception ignored in fiber_dealloc");
 +        }
 +    }
-+    if (self->c_stack != NULL) {
-+        munmap(self->c_stack, FIBER_STACK_SIZE);
-+    }
++    PyMem_RawFree(self->saved);
 +    PyTypeObject *tp = Py_TYPE(op);
 +    tp->tp_free(op);
 +    Py_DECREF(tp);
@@ -526,6 +668,7 @@ index 00000000000..6111fcef201
 +static PyGetSetDef fiber_getset[] = {
 +    {"frame", fiber_get_frame, NULL, NULL, NULL},
 +    {"state", fiber_get_state, NULL, NULL, NULL},
++    {"saved_stack_size", fiber_get_saved_stack_size, NULL, NULL, NULL},
 +    {"context", fiber_get_context, fiber_set_context, NULL, NULL},
 +    {NULL},
 +};
