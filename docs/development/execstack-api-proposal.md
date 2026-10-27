@@ -75,20 +75,16 @@ libraries.
 An opaque heap object representing one execution stack (the per-coroutine
 half). The thread state does not track these at all: the library creates one
 per coroutine _and one for the thread's original stack_, and names the
-outgoing and incoming stacks explicitly on every switch. A stack is `NEW`
-until it first runs, `RUNNING` while its state is live in the thread state,
-and `SUSPENDED` while its state is saved in the object.
+outgoing and incoming stacks explicitly on every switch. A stack is either
+running (its state is live in the thread state) or not (its state, if any
+yet, is saved in the object); whether a non-running stack has run before only
+matters to `Resume`, which either loads the saved state or starts blank, and
+is not exposed.
 
 ```c
 /* Include/cpython/pystate.h  (unstable tier) */
 
 typedef struct _PyExecStack PyUnstable_ExecStack;
-
-typedef enum {
-    PyUnstable_ExecStack_NEW = 0,
-    PyUnstable_ExecStack_RUNNING = 1,
-    PyUnstable_ExecStack_SUSPENDED = 2,
-} PyUnstable_ExecStack_State;
 
 /* Lifecycle ---------------------------------------------------------------- */
 
@@ -141,7 +137,7 @@ PyAPI_FUNC(int) PyUnstable_ExecStack_Switch(
 
 /* Introspection ------------------------------------------------------------ */
 
-PyAPI_FUNC(PyUnstable_ExecStack_State) PyUnstable_ExecStack_GetState(PyUnstable_ExecStack *);
+PyAPI_FUNC(int) PyUnstable_ExecStack_IsRunning(PyUnstable_ExecStack *);
 
 /* New reference to the topmost *complete* Python frame, or NULL (error
    cleared) if there is none -- same contract as PyThreadState_GetFrame().
@@ -233,7 +229,7 @@ greenlets and only drops the context for a suspended greenlet in a live
 thread (its frames are unwound by the `GreenletExit` thrown at dealloc). The
 main greenlet gets its stack from `Adopt` in its constructor, so the stack is
 `RUNNING` whenever the main greenlet is current.
-`is_currently_running` becomes `GetState() == RUNNING`; `gr_frame` is
+`is_currently_running` becomes `IsRunning()`; `gr_frame` is
 `GetFrame` unless running. As on 3.15, `tp_is_gc` is dropped so suspended
 greenlets are collectable. Stack copying (`StackState`, `slp_switch`) stays
 greenlet's. ~260 lines added, almost all `#if` scaffolding to keep the old
