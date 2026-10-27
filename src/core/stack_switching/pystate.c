@@ -50,16 +50,27 @@ typedef struct
 } TaskState;
 
 /**
- * Whether a promising task is currently executing. When this is true, `outer`
- * is the stack of the code that the task took over from (the event loop),
- * which is resumed when the task suspends or exits.
+ * `outer` is the execution stack of the event loop, i.e. of everything that is
+ * not a promising task. The interpreter does not track execution stacks
+ * itself, so we create this one ourselves; it adopts the thread's live state
+ * the first time a task is entered.
  *
- * A task can only ever take control from the event loop and always returns
- * control to the event loop. It is a bug to start or resume a task when in_task
- * is true.
+ * `current_task` is the stack of the task that is executing, or NULL when the
+ * event loop is. A task can only ever take control from the event loop and
+ * always returns control to the event loop. It is a bug to start or resume a
+ * task when current_task is set.
  */
-static bool in_task = false;
 static PyUnstable_ExecStack* outer = NULL;
+static PyUnstable_ExecStack* current_task = NULL;
+
+static PyUnstable_ExecStack*
+get_outer(void)
+{
+  if (outer == NULL) {
+    outer = PyUnstable_ExecStack_New(NULL);
+  }
+  return outer;
+}
 
 /**
  * Start a new task. The task runs on the same thread state as its caller but
@@ -73,7 +84,7 @@ static PyUnstable_ExecStack* outer = NULL;
 int
 enter_promising_task(void)
 {
-  if (in_task) {
+  if (current_task != NULL) {
     // Entering a promising call yields to the event loop first so this should
     // not be reachable.
     PyErr_SetString(PyExc_SystemError,
@@ -91,13 +102,12 @@ enter_promising_task(void)
     return -1;
   }
   PyThreadState* tstate = PyThreadState_Get();
-  PyUnstable_ExecStack* previous = PyUnstable_ExecStack_Switch(tstate, task);
-  if (previous == NULL) {
+  if (get_outer() == NULL ||
+      PyUnstable_ExecStack_Switch(tstate, outer, task) < 0) {
     PyUnstable_ExecStack_Free(task);
     return -1;
   }
-  outer = previous;
-  in_task = true;
+  current_task = task;
   return 0;
 }
 
@@ -111,19 +121,17 @@ enter_promising_task(void)
 void
 exit_promising_task(void)
 {
-  assert(in_task);
+  assert(current_task != NULL);
   PyThreadState* tstate = PyThreadState_Get();
-  PyUnstable_ExecStack* task = PyUnstable_ExecStack_Switch(tstate, outer);
-  if (task == NULL) {
+  PyUnstable_ExecStack* task = current_task;
+  if (PyUnstable_ExecStack_Switch(tstate, task, outer) < 0) {
     Py_FatalError("exit_promising_task: failed to switch back to the event "
                   "loop's stack. This is a bug in Pyodide.");
   }
+  current_task = NULL;
   // The task's Python code has returned, so its frame chain is empty; this
   // releases its context and the datastack memory.
-  if (PyUnstable_ExecStack_Free(task) < 0) {
-    PyErr_FormatUnraisable("Exception ignored while freeing a task's stack");
-  }
-  in_task = false;
+  PyUnstable_ExecStack_Free(task);
 }
 
 /**
@@ -141,7 +149,7 @@ exit_promising_task(void)
 EMSCRIPTEN_KEEPALIVE TaskState*
 captureTaskState(void)
 {
-  if (!in_task) {
+  if (current_task == NULL) {
     // validSuspender is supposed to prevent this. If it happens anyway, refuse
     // rather than corrupting the thread state.
     PyErr_SetString(PyExc_SystemError,
@@ -156,16 +164,16 @@ captureTaskState(void)
   }
   // Take any stray exception along with the task, see TaskState.
   saved->exception = PyErr_GetRaisedException();
+  saved->stack = current_task;
   PyThreadState* tstate = PyThreadState_Get();
-  saved->stack = PyUnstable_ExecStack_Switch(tstate, outer);
-  if (saved->stack == NULL) {
+  if (PyUnstable_ExecStack_Switch(tstate, current_task, outer) < 0) {
     // The switch failed and the thread state is untouched. Put things back
     // the way they were, but let the switch's error win.
     Py_XDECREF(saved->exception);
     free(saved);
     return NULL;
   }
-  in_task = false;
+  current_task = NULL;
   return saved;
 }
 
@@ -176,16 +184,13 @@ captureTaskState(void)
 EMSCRIPTEN_KEEPALIVE void
 restoreTaskState(TaskState* saved)
 {
-  assert(!in_task);
+  assert(current_task == NULL);
   PyThreadState* tstate = PyThreadState_Get();
-  PyUnstable_ExecStack* previous =
-    PyUnstable_ExecStack_Switch(tstate, saved->stack);
-  if (previous == NULL) {
+  if (PyUnstable_ExecStack_Switch(tstate, outer, saved->stack) < 0) {
     Py_FatalError("restoreTaskState: failed to switch to the task's stack. "
                   "This is a bug in Pyodide.");
   }
-  outer = previous;
-  in_task = true;
+  current_task = saved->stack;
   if (saved->exception != NULL) {
     PyErr_SetRaisedException(saved->exception);
   }
