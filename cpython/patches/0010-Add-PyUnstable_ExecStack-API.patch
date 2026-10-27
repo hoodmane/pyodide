@@ -18,10 +18,10 @@ suite for the API (Lib/test/test_capi/test_execstack.py, not included)
 could be run; the ucontext fiber is only compiled on Linux.
 ---
 diff --git a/Include/cpython/pystate.h b/Include/cpython/pystate.h
-index f428396411c..1fdca0e27ed 100644
+index f428396411c..a0a13cd21a2 100644
 --- a/Include/cpython/pystate.h
 +++ b/Include/cpython/pystate.h
-@@ -255,6 +255,100 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
+@@ -255,6 +255,101 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
  PyAPI_FUNC(void) PyUnstable_ThreadState_ResetStackProtection(
      PyThreadState *tstate);
  
@@ -51,10 +51,11 @@ index f428396411c..1fdca0e27ed 100644
 +
 +typedef struct _PyExecStack PyUnstable_ExecStack;
 +
-+// Create a stack with no frames and the given contextvars context (may be
-+// NULL). It is not running; the first Resume() into it starts it with an
-+// empty frame chain. Returns NULL with an exception set on failure.
-+PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(PyObject *context);
++// Create a stack with no frames and an empty contextvars context (use
++// SetContext() to give it one). It is not running; the first Switch() into
++// it starts it with an empty frame chain. Returns NULL with MemoryError on
++// failure.
++PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(void);
 +
 +// Create a running stack standing for whatever is executing on tstate right
 +// now (typically called once per thread, for the thread's original stack).
@@ -149,10 +150,10 @@ index 905ea4aa2e5..75a0f419fe3 100644
  @MODULE__TESTCLINIC_LIMITED_TRUE@_testclinic_limited _testclinic_limited.c
 diff --git a/Modules/_testcapi/execstack.c b/Modules/_testcapi/execstack.c
 new file mode 100644
-index 00000000000..88baa095bdb
+index 00000000000..0edbf2455de
 --- /dev/null
 +++ b/Modules/_testcapi/execstack.c
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,673 @@
 +/* Tests for the PyUnstable_ExecStack API.
 + *
 + * To exercise the API the way greenlet does, this file implements a minimal
@@ -557,7 +558,7 @@ index 00000000000..88baa095bdb
 +        return NULL;
 +    }
 +    self->run = Py_NewRef(run);
-+    self->stack = PyUnstable_ExecStack_New(NULL);
++    self->stack = PyUnstable_ExecStack_New();
 +    if (self->stack == NULL) {
 +        Py_DECREF(self);
 +        return NULL;
@@ -725,7 +726,7 @@ index 00000000000..88baa095bdb
 +    }
 +    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Switch(tstate, root, other),
 +                       "Switch(running, running)");
-+    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New(NULL);
++    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New();
 +    if (fresh == NULL) {
 +        return NULL;
 +    }
@@ -759,7 +760,7 @@ index 00000000000..88baa095bdb
 +    if (root == NULL) {
 +        return NULL;
 +    }
-+    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New(NULL);
++    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New();
 +    if (fresh == NULL) {
 +        return NULL;
 +    }
@@ -779,15 +780,23 @@ index 00000000000..88baa095bdb
 +    return result;
 +}
 +
++// New() + SetContext(arg) + GetContext() on a stack that never runs.
 +static PyObject *
-+execstack_new_bad_context(PyObject *self, PyObject *arg)
++execstack_new_with_context(PyObject *self, PyObject *arg)
 +{
-+    PyUnstable_ExecStack *stack = PyUnstable_ExecStack_New(arg);
++    PyUnstable_ExecStack *stack = PyUnstable_ExecStack_New();
 +    if (stack == NULL) {
 +        return NULL;
 +    }
++    PyObject *result = NULL;
++    if (PyUnstable_ExecStack_SetContext(stack, arg == Py_None ? NULL : arg) == 0) {
++        result = PyUnstable_ExecStack_GetContext(stack);
++        if (result == NULL) {
++            result = Py_NewRef(Py_None);
++        }
++    }
 +    PyUnstable_ExecStack_Free(stack);
-+    Py_RETURN_NONE;
++    return result;
 +}
 +
 +static PyMethodDef test_methods[] = {
@@ -795,7 +804,7 @@ index 00000000000..88baa095bdb
 +    {"execstack_held_state", execstack_held_state, METH_O, NULL},
 +    {"execstack_root_misuse", execstack_root_misuse, METH_O, NULL},
 +    {"execstack_run_on_fresh_stack", execstack_run_on_fresh_stack, METH_VARARGS, NULL},
-+    {"execstack_new_bad_context", execstack_new_bad_context, METH_O, NULL},
++    {"execstack_new_with_context", execstack_new_with_context, METH_O, NULL},
 +    {NULL},
 +};
 +
@@ -846,10 +855,10 @@ index 228fe4eff58..6c165be57bf 100644
      }
 diff --git a/Python/execstack.c b/Python/execstack.c
 new file mode 100644
-index 00000000000..8dcfaf925b6
+index 00000000000..80df7769247
 --- /dev/null
 +++ b/Python/execstack.c
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,765 @@
 +/* Execution stacks: the per-coroutine part of a PyThreadState.
 + *
 + * See the comment block in Include/cpython/pystate.h for the API contract.
@@ -1358,19 +1367,9 @@ index 00000000000..8dcfaf925b6
 +/* Public API --------------------------------------------------------------- */
 +
 +PyUnstable_ExecStack *
-+PyUnstable_ExecStack_New(PyObject *context)
++PyUnstable_ExecStack_New(void)
 +{
-+    if (context != NULL && !PyContext_CheckExact(context)) {
-+        PyErr_Format(PyExc_TypeError,
-+                     "expected a Context object or NULL, got %T", context);
-+        return NULL;
-+    }
-+    PyUnstable_ExecStack *stack = execstack_alloc();
-+    if (stack == NULL) {
-+        return NULL;
-+    }
-+    stack->context = Py_XNewRef(context);
-+    return stack;
++    return execstack_alloc();
 +}
 +
 +PyUnstable_ExecStack *

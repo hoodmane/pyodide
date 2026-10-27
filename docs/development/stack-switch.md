@@ -28,19 +28,58 @@ version is a similarly high maintenance burden.s
 The hope is that once this API is introduced, Greenlet and Pyodide can switch to
 using these APIs and will not need to change much to support new Python APIs.
 
-## Overall Idea
+## API
 
 We partition the `PyThreadState` into two groups:
 
 1. Fields that should be shared between all tasks.
 2. Fields that are per-task
 
-The core of the API is a new struct called `PyUnstable_ExecStack` which holds
-all the per-task fields. We define two APIs to do this:
-```C
-PyUnstable_ExecStack *PyUnstable_ExecStack_Suspend(PyThreadState *)
+All the per-task fields are held in a new struct called `PyUnstable_ExecStack`.
+It also has a `state` field that records whether or not it is "active".
 
-int PyUnstable_ExecStack_Resume(PyThreadState *, PyUnstable_ExecStack *target)
+The key API is `PyUnstable_ExecStack_Switch`:
+```C
+int PyUnstable_ExecStack_Switch(
+    PyThreadState *tstate,
+    PyUnstable_ExecStack *current,
+    PyUnstable_ExecStack *target);
+```
+`PyUnstable_ExecStack_Switch` switches the `ExecStack` by copying the fields in
+the current `tstate` into `current` and copying the fields from `target` into
+`tstate`. Before calling this function, the `state` of `current` must be
+"active" and the state of `target` must be "suspended". After the call, this is
+swapped: `current` will be in state "suspended" and `target` will be in state
+"active".
+
+There are two APIs to create an `ExecStack`:
+```C
+PyUnstable_ExecStack *PyUnstable_ExecStack_Adopt(PyThreadState *);
+PyUnstable_ExecStack *PyUnstable_ExecStack_New();
+```
+`PyUnstable_ExecStack_Adopt` creates an "active" `ExecStack` from the given
+threadstate. `PyUnstable_ExecStack_New()` creates a "suspended" `ExecStack`.
+
+An `ExecStack` must be freed with `PyUnstable_ExecStack_Free()`. If the
+`ExecStack` is owned by a a Python object the following three functions must be
+called respectively in `tp_free`, `tp_clear`, and `tp_traverse`:
+```C
+void PyUnstable_ExecStack_Free(PyUnstable_ExecStack *);
+int PyUnstable_ExecStack_Clear(PyUnstable_ExecStack *);
+int PyUnstable_ExecStack_Traverse(PyUnstable_ExecStack *, visitproc, void *);
+```
+
+The following two APIs are needed by greenlet:
+
+```C
+int PyUnstable_ExecStack_IsRunning(PyUnstable_ExecStack *);
+PyFrameObject *PyUnstable_ExecStack_GetFrame(PyUnstable_ExecStack *);
+```
+
+The following two APIs are used to get and set the asyncio context variables:
+```C
+PyObject *PyUnstable_ExecStack_GetContext(PyUnstable_ExecStack *);
+int  PyUnstable_ExecStack_SetContext(PyUnstable_ExecStack *, PyObject *);
 ```
 
 

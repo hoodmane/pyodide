@@ -95,9 +95,15 @@ enter_promising_task(void)
   if (context == NULL) {
     return -1;
   }
-  PyUnstable_ExecStack* task = PyUnstable_ExecStack_New(context);
-  Py_DECREF(context);
+  PyUnstable_ExecStack* task = PyUnstable_ExecStack_New();
   if (task == NULL) {
+    Py_DECREF(context);
+    return -1;
+  }
+  int status = PyUnstable_ExecStack_SetContext(task, context);
+  Py_DECREF(context);
+  if (status < 0) {
+    PyUnstable_ExecStack_Free(task);
     return -1;
   }
   PyThreadState* tstate = PyThreadState_Get();

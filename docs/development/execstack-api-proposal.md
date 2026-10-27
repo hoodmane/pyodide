@@ -88,11 +88,11 @@ typedef struct _PyExecStack PyUnstable_ExecStack;
 
 /* Lifecycle ---------------------------------------------------------------- */
 
-/* A fresh stack: no frames, no datastack, empty exception stack, context =
-   Py_XNewRef(context) (NULL => empty context). Recursion depth and tracing
-   depth are inherited from the stack being switched *from* on the first
-   Switch() into it. */
-PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(PyObject *context);
+/* A fresh stack: no frames, no datastack, empty exception stack, empty
+   context (SetContext() to change). Recursion depth and tracing depth are
+   inherited from the stack being switched *from* on the first Switch() into
+   it. */
+PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(void);
 
 /* A RUNNING stack standing for whatever is executing on tstate right now:
    the thread's original stack. Touches nothing in the thread state. */
@@ -239,7 +239,8 @@ static PyUnstable_ExecStack *current_task; /* NULL while the event loop runs */
 int enter_promising_task(void) {
     PyObject *ctx = PyContext_CopyCurrent();
     if (!ctx) return -1;
-    PyUnstable_ExecStack *task = PyUnstable_ExecStack_New(ctx);
+    PyUnstable_ExecStack *task = PyUnstable_ExecStack_New();
+    if (task) PyUnstable_ExecStack_SetContext(task, ctx);
     Py_DECREF(ctx);
     if (!task || PyUnstable_ExecStack_Switch(tstate, outer, task) < 0) return -1;
     current_task = task;
@@ -315,9 +316,9 @@ Pyodide actually run:
 
 ## Open questions
 
-1. **Context on `New`**: `NULL` meaning "empty context" (greenlet semantics)
-   vs "copy of current" (Pyodide). Proposed: `NULL` = empty; callers pass
-   `PyContext_CopyCurrent()` if they want a copy. One line either way.
+1. **Context on `New`**: resolved by not having one. `New()` gives an empty
+   context (greenlet semantics); Pyodide calls `SetContext` with
+   `PyContext_CopyCurrent()`.
 2. **Inherit vs reset recursion/tracing depth** on first switch into a `NEW`
    stack. Both libraries inherit today; keep that but document it.
 3. **`asyncio_running_task`**: Pyodide swaps it, greenlet doesn't. Per-stack
