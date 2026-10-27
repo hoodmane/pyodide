@@ -52,8 +52,8 @@ typedef struct
 /**
  * `outer` is the execution stack of the event loop, i.e. of everything that is
  * not a promising task. The interpreter does not track execution stacks
- * itself, so we create this one ourselves; it adopts the thread's live state
- * the first time a task is entered.
+ * itself, so we create this one ourselves with PyUnstable_ExecStack_Adopt()
+ * the first time a task is entered (the event loop is what is running then).
  *
  * `current_task` is the stack of the task that is executing, or NULL when the
  * event loop is. A task can only ever take control from the event loop and
@@ -64,10 +64,10 @@ static PyUnstable_ExecStack* outer = NULL;
 static PyUnstable_ExecStack* current_task = NULL;
 
 static PyUnstable_ExecStack*
-get_outer(void)
+get_outer(PyThreadState* tstate)
 {
   if (outer == NULL) {
-    outer = PyUnstable_ExecStack_New(NULL);
+    outer = PyUnstable_ExecStack_Adopt(tstate);
   }
   return outer;
 }
@@ -102,7 +102,7 @@ enter_promising_task(void)
     return -1;
   }
   PyThreadState* tstate = PyThreadState_Get();
-  if (get_outer() == NULL ||
+  if (get_outer(tstate) == NULL ||
       PyUnstable_ExecStack_Switch(tstate, outer, task) < 0) {
     PyUnstable_ExecStack_Free(task);
     return -1;

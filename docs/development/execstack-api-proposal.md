@@ -95,9 +95,12 @@ typedef enum {
 /* A fresh stack: no frames, no datastack, empty exception stack, context =
    Py_XNewRef(context) (NULL => empty context). Recursion depth and tracing
    depth are inherited from the stack being switched *from* on the first
-   Resume() into it. Also used for the thread's original stack: pass a NEW
-   stack to Suspend() and it adopts whatever is running. */
+   Resume() into it. */
 PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(PyObject *context);
+
+/* A RUNNING stack standing for whatever is executing on tstate right now:
+   the thread's original stack. Touches nothing in the thread state. */
+PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_Adopt(PyThreadState *);
 
 /* Release everything the stack owns: context, exc_value, asyncio task,
    datastack chunks, and -- if SUSPENDED with live frames -- clear those
@@ -114,8 +117,8 @@ PyAPI_FUNC(void) PyUnstable_ExecStack_Free(PyUnstable_ExecStack *);
 /* Switching ---------------------------------------------------------------- */
 
 /* Move the per-stack fields of tstate into `stack` and mark it SUSPENDED.
-   `stack` must be the RUNNING stack of tstate, or a NEW stack (which adopts
-   the live state). -1 + exception with tstate untouched on failure. Must be
+   `stack` must be the RUNNING stack of tstate. -1 + exception with tstate
+   untouched on failure. Must be
    called while the *outgoing* C stack is still intact: the interpreter reads
    the entry frames it keeps there. Until Resume(), no Python code may run. */
 PyAPI_FUNC(int) PyUnstable_ExecStack_Suspend(PyThreadState *, PyUnstable_ExecStack *stack);
@@ -187,7 +190,7 @@ Pyodide both run on slices of the thread's own stack.
   that is not actually running (it can only check the per-stack state
   machine and thread id); the benefit is no hidden allocation, no reference
   counting, and no special "root" stack -- the thread's original stack is
-  just a `NEW` stack handed to the first `Suspend`.
+  an ordinary stack object obtained from `Adopt`.
 - **`Switch` is the only place the frame chain is rewired.** On suspend,
   CPython walks the chain while the C stack is still live and, for every
   datastack frame whose `previous` is a C-stack entry frame
@@ -228,8 +231,7 @@ calls `Suspend` where `operator<<` used to be (before `slp_switch()`), and
 calls `Traverse`; `tp_clear` calls `Clear` for dead/unstarted/dead-thread
 greenlets and only drops the context for a suspended greenlet in a live
 thread (its frames are unwound by the `GreenletExit` thrown at dealloc). The
-main greenlet creates its own stack with `New` and adopts the thread's live
-state in its constructor (`Suspend` + `Resume` in place), so the stack is
+main greenlet gets its stack from `Adopt` in its constructor, so the stack is
 `RUNNING` whenever the main greenlet is current.
 `is_currently_running` becomes `GetState() == RUNNING`; `gr_frame` is
 `GetFrame` unless running. As on 3.15, `tp_is_gc` is dropped so suspended
@@ -240,7 +242,7 @@ path for older Pythons; the actual new logic is ~60 lines.
 **Pyodide.** `pystate.c` + `pystate_pycore.c` reduce to roughly:
 
 ```c
-static PyUnstable_ExecStack *outer;        /* the event loop's stack, New()'d once */
+static PyUnstable_ExecStack *outer;        /* the event loop's stack, Adopt()'d once */
 static PyUnstable_ExecStack *current_task; /* NULL while the event loop runs */
 
 int enter_promising_task(void) {
@@ -292,8 +294,8 @@ Pyodide actually run:
    to it, and clean up in `PyThreadState_Clear`; that forced reference
    counting (greenlet's main greenlet outlives its thread) and a
    `root_exec_stack` field that existed only for teardown. Making the
-   library create the original stack's object too, and pass the outgoing
-   stack to `Suspend` explicitly, removed all of it.
+   library create the original stack's object too (`Adopt`), and pass the
+   outgoing stack to `Suspend` explicitly, removed all of it.
 3. **The error indicator travels with control.** greenlet's `throw` works
    by setting the error indicator and switching; so does throwing into a
    never-started greenlet. Making `current_exception` per-stack would have
