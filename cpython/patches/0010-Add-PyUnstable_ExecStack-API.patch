@@ -18,10 +18,10 @@ suite for the API (Lib/test/test_capi/test_execstack.py, not included)
 could be run; the ucontext fiber is only compiled on Linux.
 ---
 diff --git a/Include/cpython/pystate.h b/Include/cpython/pystate.h
-index f428396411c..8d015cc4df2 100644
+index f428396411c..34adc4333c4 100644
 --- a/Include/cpython/pystate.h
 +++ b/Include/cpython/pystate.h
-@@ -255,6 +255,116 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
+@@ -255,6 +255,118 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
  PyAPI_FUNC(void) PyUnstable_ThreadState_ResetStackProtection(
      PyThreadState *tstate);
  
@@ -105,13 +105,15 @@ index f428396411c..8d015cc4df2 100644
 +// Return a new reference to the topmost complete frame of the stack, or NULL
 +// (with the error indicator cleared) if there is none. Same contract as
 +// PyThreadState_GetFrame(). Safe to call on a SUSPENDED stack; f_back on the
-+// result is also safe.
++// result is also safe. A RUNNING stack's frames live in its thread state and
++// can only be read from that thread; from any other thread this returns NULL.
 +PyAPI_FUNC(PyFrameObject *) PyUnstable_ExecStack_GetFrame(
 +    PyUnstable_ExecStack *stack);
 +
 +// Contextvars context of the stack. GetContext returns a new reference or
-+// NULL. SetContext accepts NULL or a PyContext. For the RUNNING stack of the
-+// current thread these operate on the thread state.
++// NULL. SetContext accepts NULL or a PyContext. For a RUNNING stack these
++// operate on its thread state and must be called from that thread: GetContext
++// returns NULL and SetContext fails with SystemError from any other thread.
 +PyAPI_FUNC(PyObject *) PyUnstable_ExecStack_GetContext(
 +    PyUnstable_ExecStack *stack);
 +PyAPI_FUNC(int) PyUnstable_ExecStack_SetContext(
@@ -898,10 +900,10 @@ index 228fe4eff58..6c165be57bf 100644
      }
 diff --git a/Python/execstack.c b/Python/execstack.c
 new file mode 100644
-index 00000000000..76a35272b37
+index 00000000000..596740c3243
 --- /dev/null
 +++ b/Python/execstack.c
-@@ -0,0 +1,774 @@
+@@ -0,0 +1,799 @@
 +/* Execution stacks: the per-coroutine part of a PyThreadState.
 + *
 + * See the comment block in Include/cpython/pystate.h for the API contract.
@@ -940,7 +942,10 @@ index 00000000000..76a35272b37
 +} execstack_link;
 +
 +struct _PyExecStack {
-+    PyThreadState *tstate;   // thread this stack runs/ran on, NULL if NEW
++    uint64_t tstate_id;      // id of the thread this stack runs/ran on,
++                             // 0 if NEW. An id rather than a pointer: a
++                             // suspended stack may outlive its thread and
++                             // the address could be reused.
 +    Py_ssize_t refs;         // owners: New()/GetExecStack() callers, tstate
 +    int state;               // PyUnstable_ExecStack_State
 +    int is_root;             // created for a thread's original stack
@@ -982,6 +987,22 @@ index 00000000000..76a35272b37
 +is_cstack_frame(_PyInterpreterFrame *frame)
 +{
 +    return frame->owner >= FRAME_OWNED_BY_INTERPRETER;
++}
++
++// The thread state a RUNNING stack's live fields are in. Only the thread the
++// stack is running on may look at them (anything else would be a race), so
++// this fails if called from another thread.
++static PyThreadState *
++running_tstate(PyUnstable_ExecStack *stack)
++{
++    assert(stack->state == PyUnstable_ExecStack_RUNNING);
++    PyThreadState *tstate = _PyThreadState_GET();
++    if (tstate == NULL || tstate->id != stack->tstate_id) {
++        PyErr_SetString(PyExc_SystemError,
++                        "execution stack is running on another thread");
++        return NULL;
++    }
++    return tstate;
 +}
 +
 +static PyUnstable_ExecStack *
@@ -1026,7 +1047,7 @@ index 00000000000..76a35272b37
 +    if (root == NULL) {
 +        return NULL;
 +    }
-+    root->tstate = tstate;
++    root->tstate_id = tstate->id;
 +    root->is_root = 1;
 +    root->state = PyUnstable_ExecStack_RUNNING;
 +    impl->exec_stack = root;
@@ -1409,7 +1430,7 @@ index 00000000000..76a35272b37
 +                        "execution stack has been cleared");
 +        return -1;
 +    }
-+    if (target->tstate != NULL && target->tstate != tstate) {
++    if (target->tstate_id != 0 && target->tstate_id != tstate->id) {
 +        PyErr_SetString(PyExc_SystemError,
 +                        "execution stack belongs to a different thread");
 +        return -1;
@@ -1468,7 +1489,7 @@ index 00000000000..76a35272b37
 +    }
 +
 +    if (target->state == PyUnstable_ExecStack_NEW) {
-+        target->tstate = tstate;
++        target->tstate_id = tstate->id;
 +        init_fresh_state(tstate, target);
 +    }
 +    else {
@@ -1512,8 +1533,14 @@ index 00000000000..76a35272b37
 +{
 +    _PyInterpreterFrame *frame;
 +    switch (stack->state) {
-+    case PyUnstable_ExecStack_RUNNING:
-+        return PyThreadState_GetFrame(stack->tstate);
++    case PyUnstable_ExecStack_RUNNING: {
++        PyThreadState *tstate = running_tstate(stack);
++        if (tstate == NULL) {
++            PyErr_Clear();
++            return NULL;
++        }
++        return PyThreadState_GetFrame(tstate);
++    }
 +    case PyUnstable_ExecStack_SUSPENDED:
 +        frame = _PyFrame_GetFirstComplete(stack->top_frame);
 +        break;
@@ -1535,7 +1562,12 @@ index 00000000000..76a35272b37
 +PyUnstable_ExecStack_GetContext(PyUnstable_ExecStack *stack)
 +{
 +    if (stack->state == PyUnstable_ExecStack_RUNNING) {
-+        return Py_XNewRef(stack->tstate->context);
++        PyThreadState *tstate = running_tstate(stack);
++        if (tstate == NULL) {
++            PyErr_Clear();
++            return NULL;
++        }
++        return Py_XNewRef(tstate->context);
 +    }
 +    return Py_XNewRef(stack->context);
 +}
@@ -1549,11 +1581,8 @@ index 00000000000..76a35272b37
 +        return -1;
 +    }
 +    if (stack->state == PyUnstable_ExecStack_RUNNING) {
-+        PyThreadState *tstate = stack->tstate;
-+        if (tstate != _PyThreadState_GET()) {
-+            PyErr_SetString(PyExc_SystemError,
-+                            "cannot set the context of a stack running on "
-+                            "another thread");
++        PyThreadState *tstate = running_tstate(stack);
++        if (tstate == NULL) {
 +            return -1;
 +        }
 +        Py_XSETREF(tstate->context, Py_XNewRef(context));
@@ -1654,7 +1683,6 @@ index 00000000000..76a35272b37
 +        // by PyThreadState_Clear. Leave the object empty and detached so
 +        // that any remaining owner can still inspect and free it.
 +        running->state = PyUnstable_ExecStack_SUSPENDED;
-+        running->tstate = NULL;
 +        running->cleared = 1;
 +        running->current_frame = NULL;
 +        running->top_frame = NULL;
@@ -1668,7 +1696,6 @@ index 00000000000..76a35272b37
 +        // The thread is exiting while a user stack is running. The root
 +        // stack is suspended and owns the thread's original frames.
 +        clear_state(root);
-+        root->tstate = NULL;
 +    }
 +    // Drop the thread state's reference to the root.
 +    assert(root->refs > 0);
