@@ -18,10 +18,10 @@ suite for the API (Lib/test/test_capi/test_execstack.py, not included)
 could be run; the ucontext fiber is only compiled on Linux.
 ---
 diff --git a/Include/cpython/pystate.h b/Include/cpython/pystate.h
-index f428396411c..69d77067609 100644
+index f428396411c..1fdca0e27ed 100644
 --- a/Include/cpython/pystate.h
 +++ b/Include/cpython/pystate.h
-@@ -255,6 +255,112 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
+@@ -255,6 +255,100 @@ PyAPI_FUNC(int) PyUnstable_ThreadState_SetStackProtection(
  PyAPI_FUNC(void) PyUnstable_ThreadState_ResetStackProtection(
      PyThreadState *tstate);
  
@@ -62,30 +62,18 @@ index f428396411c..69d77067609 100644
 +PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_Adopt(
 +    PyThreadState *tstate);
 +
-+// Move the per-stack state out of tstate into `stack`, which must be the
-+// stack that is running on tstate.
-+// Returns -1 with an exception set and the thread state unchanged on failure.
-+// Must be called while attached to tstate and while the C stack of the
-+// running code is still intact: the interpreter reads the frames it keeps on
-+// the C stack. Afterwards, until PyUnstable_ExecStack_Resume() is called, no
-+// Python code may run and nothing but the low-level C stack switch itself may
-+// happen. Does not run Python code.
-+PyAPI_FUNC(int) PyUnstable_ExecStack_Suspend(
-+    PyThreadState *tstate,
-+    PyUnstable_ExecStack *stack);
-+
-+// Install `target` as the running stack of tstate after a Suspend().
-+// `target` must not be running and, if it has run before, must have run on
-+// tstate. Must be called once the C stack of `target` is in place. Returns -1
-+// with SystemError on misuse; cannot fail otherwise. Does not run Python code.
-+PyAPI_FUNC(int) PyUnstable_ExecStack_Resume(
-+    PyThreadState *tstate,
-+    PyUnstable_ExecStack *target);
-+
-+// Suspend(current) followed by Resume(target), for implementations whose
-+// outgoing and incoming C stacks are both intact at the same time (e.g.
-+// separately allocated stacks). Returns -1 with an exception set and the
-+// thread state unchanged on failure. A no-op if current == target.
++// Move the per-stack state out of tstate into `current`, which must be the
++// stack that is running on tstate, and install `target`, which must not be
++// running and, if it has run before, must have run on tstate. A no-op if the
++// two are the same. Returns -1 with an exception set and the thread state
++// unchanged on failure.
++//
++// Call this *before* switching C stacks, while attached to tstate and while
++// the outgoing C stack is still intact: the interpreter reads the frames and
++// critical sections it keeps there. It does not read the incoming C stack, so
++// it is fine if that has not been restored yet (as in greenlet, where the two
++// share the same memory). No Python code may run between this call and the
++// completion of the C stack switch. Does not run Python code itself.
 +PyAPI_FUNC(int) PyUnstable_ExecStack_Switch(
 +    PyThreadState *tstate,
 +    PyUnstable_ExecStack *current,
@@ -161,10 +149,10 @@ index 905ea4aa2e5..75a0f419fe3 100644
  @MODULE__TESTCLINIC_LIMITED_TRUE@_testclinic_limited _testclinic_limited.c
 diff --git a/Modules/_testcapi/execstack.c b/Modules/_testcapi/execstack.c
 new file mode 100644
-index 00000000000..87417638a97
+index 00000000000..88baa095bdb
 --- /dev/null
 +++ b/Modules/_testcapi/execstack.c
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,665 @@
 +/* Tests for the PyUnstable_ExecStack API.
 + *
 + * To exercise the API the way greenlet does, this file implements a minimal
@@ -185,9 +173,10 @@ index 00000000000..87417638a97
 + *    fiber is read out of its ucontext_t. That is the only platform specific
 + *    part, so this is only built for x86-64 glibc.
 + *
-+ *  - The split Suspend()/Resume() protocol is therefore not just exercised
-+ *    but required: Suspend() runs before the outgoing C stack is destroyed
-+ *    and Resume() after the incoming one has been restored.
++ *  - PyUnstable_ExecStack_Switch() is called before the C stack switch, as
++ *    its contract requires: it reads the outgoing C stack (still intact at
++ *    that point) and must not read the incoming one (still spilled). The
++ *    poisoning makes any violation of the latter crash.
 + */
 +
 +#include "parts.h"
@@ -371,9 +360,12 @@ index 00000000000..87417638a97
 +            return -1;
 +        }
 +    }
-+    // Save the Python side of our stack while our C stack is still intact.
++    // Switch the Python side while our C stack is still intact. From here
++    // until the trampoline has restored the target's C stack, the thread
++    // state describes the target but no Python code may run.
 +    PyUnstable_ExecStack *mine = from ? from->stack : root_exec_stack;
-+    if (PyUnstable_ExecStack_Suspend(tstate, mine) < 0) {
++    PyUnstable_ExecStack *theirs = to ? to->stack : root_exec_stack;
++    if (PyUnstable_ExecStack_Switch(tstate, mine, theirs) < 0) {
 +        return -1;
 +    }
 +
@@ -387,14 +379,7 @@ index 00000000000..87417638a97
 +    makecontext(&trampoline_ctx, trampoline, 0);
 +    swapcontext(from ? &from->ctx : &root_ctx, &trampoline_ctx);
 +
-+    // Somebody switched back to us. Our C stack has been restored, so locals
-+    // are valid again, but follow greenlet's discipline and reload from
-+    // thread-local state anyway. `current` was set to us by the switcher.
-+    tstate = PyThreadState_Get();
-+    mine = current ? current->stack : root_exec_stack;
-+    if (PyUnstable_ExecStack_Resume(tstate, mine) < 0) {
-+        Py_FatalError("fiber: PyUnstable_ExecStack_Resume failed after switch");
-+    }
++    // Somebody switched back to us; they already switched the Python side.
 +    return 0;
 +}
 +
@@ -402,11 +387,7 @@ index 00000000000..87417638a97
 +void
 +fiber_entry(void)
 +{
-+    FiberObject *self = current;
-+    PyThreadState *tstate = PyThreadState_Get();
-+    if (PyUnstable_ExecStack_Resume(tstate, self->stack) < 0) {
-+        Py_FatalError("fiber: PyUnstable_ExecStack_Resume failed in entry");
-+    }
++    FiberObject *self = current;   // our stack is already installed
 +
 +    PyObject *arg = self->transfer;
 +    self->transfer = NULL;
@@ -666,7 +647,7 @@ index 00000000000..87417638a97
 +
 +
 +/* Tests of the API on the thread's own stack, without any C stack switching:
-+ * Adopt() the running state, Suspend()/Resume() it in place, misuse. The
++ * Adopt() the running state, switch between two stacks in place, misuse. The
 + * "root" here is a stack object we create and keep in a capsule. */
 +
 +static void
@@ -733,48 +714,69 @@ index 00000000000..87417638a97
 +    }
 +    // `root` is RUNNING on this thread.
 +    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Clear(root), "Clear(running)");
-+    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Resume(tstate, root),
-+                       "Resume(running)");
 +    if (PyUnstable_ExecStack_Switch(tstate, root, root) < 0) {
 +        return NULL;   // must be a no-op
 +    }
-+    // Suspend/Resume round trip on the same stack.
-+    if (PyUnstable_ExecStack_Suspend(tstate, root) < 0) {
++    // A second RUNNING stack for the same thread: can't switch to it, and
++    // can't switch *from* a stack that isn't running.
++    PyUnstable_ExecStack *other = PyUnstable_ExecStack_Adopt(tstate);
++    if (other == NULL) {
 +        return NULL;
 +    }
-+    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Suspend(tstate, root),
-+                       "Suspend(suspended)");
-+    if (PyUnstable_ExecStack_Resume(tstate, root) < 0) {
++    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Switch(tstate, root, other),
++                       "Switch(running, running)");
++    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New(NULL);
++    if (fresh == NULL) {
 +        return NULL;
 +    }
-+    // A NEW stack can't be suspended: only Resume() starts it.
-+    PyUnstable_ExecStack *dead = PyUnstable_ExecStack_New(NULL);
-+    if (dead == NULL) {
++    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Switch(tstate, fresh, root),
++                       "Switch(new, ...)");
++    // A cleared stack can't be switched to.
++    if (PyUnstable_ExecStack_Clear(fresh) < 0) {
 +        return NULL;
 +    }
-+    if (PyUnstable_ExecStack_Suspend(tstate, dead) == 0) {
-+        PyErr_SetString(PyExc_AssertionError, "Suspend(new) succeeded");
-+        return NULL;
-+    }
-+    if (!PyErr_ExceptionMatches(PyExc_SystemError)) {
-+        return NULL;
-+    }
-+    PyErr_Clear();
-+    // A cleared stack can't be resumed.
-+    if (PyUnstable_ExecStack_Clear(dead) < 0) {
-+        PyUnstable_ExecStack_Free(dead);
-+        return NULL;
-+    }
-+    if (PyUnstable_ExecStack_Switch(tstate, root, dead) == 0) {
-+        PyErr_SetString(PyExc_AssertionError, "Switch to cleared succeeded");
-+        return NULL;
-+    }
-+    PyUnstable_ExecStack_Free(dead);
-+    if (!PyErr_ExceptionMatches(PyExc_SystemError)) {
-+        return NULL;
-+    }
-+    PyErr_Clear();
++    EXPECT_SYSTEMERROR(PyUnstable_ExecStack_Switch(tstate, root, fresh),
++                       "Switch to cleared");
++    PyUnstable_ExecStack_Free(fresh);
++    PyUnstable_ExecStack_Free(other);
 +    Py_RETURN_NONE;
++}
++
++// Round trip without any C stack switching: switch from the root to a fresh
++// stack, call `func` on it (its frames hang off an empty chain), switch back.
++// The C stack is shared and intact throughout, which is allowed since the
++// new stack's "entry frames" are simply the ones the eval loop pushes now.
++// Returns (result_of_func, frame_seen_by_func_or_None).
++static PyObject *
++execstack_run_on_fresh_stack(PyObject *self, PyObject *args)
++{
++    PyObject *capsule, *func;
++    if (!PyArg_ParseTuple(args, "OO", &capsule, &func)) {
++        return NULL;
++    }
++    PyThreadState *tstate = PyThreadState_Get();
++    PyUnstable_ExecStack *root = PyCapsule_GetPointer(capsule, "execstack");
++    if (root == NULL) {
++        return NULL;
++    }
++    PyUnstable_ExecStack *fresh = PyUnstable_ExecStack_New(NULL);
++    if (fresh == NULL) {
++        return NULL;
++    }
++    if (PyUnstable_ExecStack_Switch(tstate, root, fresh) < 0) {
++        PyUnstable_ExecStack_Free(fresh);
++        return NULL;
++    }
++    PyObject *result = PyObject_CallNoArgs(func);
++    // The error indicator travels with control, so an exception from func
++    // simply stays set across the switch back.
++    if (PyUnstable_ExecStack_Switch(tstate, fresh, root) < 0) {
++        Py_XDECREF(result);
++        PyUnstable_ExecStack_Free(fresh);
++        return NULL;
++    }
++    PyUnstable_ExecStack_Free(fresh);
++    return result;
 +}
 +
 +static PyObject *
@@ -792,6 +794,7 @@ index 00000000000..87417638a97
 +    {"execstack_adopt_current", execstack_adopt_current, METH_NOARGS, NULL},
 +    {"execstack_held_state", execstack_held_state, METH_O, NULL},
 +    {"execstack_root_misuse", execstack_root_misuse, METH_O, NULL},
++    {"execstack_run_on_fresh_stack", execstack_run_on_fresh_stack, METH_VARARGS, NULL},
 +    {"execstack_new_bad_context", execstack_new_bad_context, METH_O, NULL},
 +    {NULL},
 +};
@@ -843,10 +846,10 @@ index 228fe4eff58..6c165be57bf 100644
      }
 diff --git a/Python/execstack.c b/Python/execstack.c
 new file mode 100644
-index 00000000000..cd6d85cab14
+index 00000000000..8dcfaf925b6
 --- /dev/null
 +++ b/Python/execstack.c
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,775 @@
 +/* Execution stacks: the per-coroutine part of a PyThreadState.
 + *
 + * See the comment block in Include/cpython/pystate.h for the API contract.
@@ -854,11 +857,19 @@ index 00000000000..cd6d85cab14
 + * The thread state knows nothing about execution stacks. A library creates
 + * one _PyExecStack per coroutine with PyUnstable_ExecStack_New(), one for
 + * the thread's original stack with PyUnstable_ExecStack_Adopt(), and tells
-+ * us which is which: PyUnstable_ExecStack_Suspend(tstate, stack) moves the
-+ * per-stack fields of the thread state into `stack` (which must be the one
-+ * that is running) and PyUnstable_ExecStack_Resume(tstate, target) loads
-+ * `target`. While a stack is RUNNING its saved fields are meaningless: the
-+ * live values are in the thread state.
++ * us which is which: PyUnstable_ExecStack_Switch(tstate, current, target)
++ * moves the per-stack fields of the thread state into `current` (which must
++ * be the one that is running) and loads `target`. While a stack is RUNNING
++ * its saved fields are meaningless: the live values are in the thread state.
++ *
++ * Switch() is called *before* the library switches C stacks. Saving reads
++ * the outgoing C stack (the entry frames, and on free-threaded builds the
++ * critical sections, live there), so it must happen while that stack is
++ * intact. Loading, on the other hand, only writes to the thread state and to
++ * heap frames -- it stores pointers into the incoming C stack but never
++ * dereferences them -- so it does not need the incoming C stack yet. That is
++ * what lets libraries like greenlet, which overwrite the outgoing C stack
++ * with the incoming one, use a single call.
 + *
 + * The frame chain of a suspended stack needs special care. The eval loop keeps
 + * an "entry frame" (_PyEntryFrame in ceval.c) as a C local every time it is
@@ -922,6 +933,11 @@ index 00000000000..cd6d85cab14
 +    PyObject *asyncio_running_task;        // strong
 +    uintptr_t critical_section;
 +#ifdef Py_GIL_DISABLED
++    // Mutexes of the topmost critical section, copied out at suspension
++    // because the PyCriticalSection itself lives on the (then spilled) C
++    // stack and load_state() must not touch it.
++    PyMutex *cs_mutex1;
++    PyMutex *cs_mutex2;
 +    _PyCStackRef *c_stack_refs;
 +    // Strong references to the objects held by the C-stack refs above,
 +    // taken at suspension so the GC can see them while the C stack is gone.
@@ -1145,9 +1161,21 @@ index 00000000000..cd6d85cab14
 +    // Release the locks held by critical sections on the stack we are
 +    // leaving, exactly as detaching from the thread would. Otherwise the
 +    // stack we switch to could deadlock trying to take one of them.
++#ifdef Py_GIL_DISABLED
++    stack->cs_mutex1 = NULL;
++    stack->cs_mutex2 = NULL;
 +    if (tstate->critical_section != 0) {
++        // Remember what to re-lock before the C stack goes away.
++        uintptr_t tag = tstate->critical_section;
++        PyCriticalSection *c =
++            (PyCriticalSection *)(tag & ~_Py_CRITICAL_SECTION_MASK);
++        stack->cs_mutex1 = c->_cs_mutex;
++        if (tag & _Py_CRITICAL_SECTION_TWO_MUTEXES) {
++            stack->cs_mutex2 = ((PyCriticalSection2 *)c)->_cs_mutex2;
++        }
 +        _PyCriticalSection_SuspendAll(tstate);
 +    }
++#endif
 +    stack->critical_section = tstate->critical_section;
 +
 +#ifdef Py_GIL_DISABLED
@@ -1197,11 +1225,27 @@ index 00000000000..cd6d85cab14
 +
 +    tstate->critical_section = stack->critical_section;
 +    stack->critical_section = 0;
-+    if (tstate->critical_section != 0) {
-+        _PyCriticalSection_Resume(tstate);
-+    }
-+
 +#ifdef Py_GIL_DISABLED
++    if (tstate->critical_section != 0) {
++        // Like _PyCriticalSection_Resume(), but from the copies made in
++        // save_state(): the PyCriticalSection is on the incoming C stack,
++        // which the library has not restored yet. While we wait for the
++        // locks the tag is still marked INACTIVE, so a detach in the
++        // meantime (SuspendAll stops at an inactive head) leaves it alone
++        // and an attach (Resume) would find NULL mutexes -- which is why
++        // _PyCriticalSection_Resume NULLs them too; here they simply are
++        // not reachable through tstate at all.
++        assert(!_PyCriticalSection_IsActive(tstate->critical_section));
++        if (stack->cs_mutex1) {
++            PyMutex_Lock(stack->cs_mutex1);
++        }
++        if (stack->cs_mutex2) {
++            PyMutex_Lock(stack->cs_mutex2);
++        }
++        stack->cs_mutex1 = NULL;
++        stack->cs_mutex2 = NULL;
++        tstate->critical_section &= ~_Py_CRITICAL_SECTION_INACTIVE;
++    }
 +    impl->c_stack_refs = stack->c_stack_refs;
 +    stack->c_stack_refs = NULL;
 +    drop_c_stack_ref_snapshot(stack);
@@ -1298,6 +1342,10 @@ index 00000000000..cd6d85cab14
 +        stack->delete_later = NULL;
 +        stack->current_executor = NULL;
 +        stack->critical_section = 0;
++#ifdef Py_GIL_DISABLED
++        stack->cs_mutex1 = NULL;
++        stack->cs_mutex2 = NULL;
++#endif
 +        free_datastack(stack);
 +#ifdef Py_GIL_DISABLED
 +        stack->c_stack_refs = NULL;
@@ -1368,12 +1416,10 @@ index 00000000000..cd6d85cab14
 +    return 0;
 +}
 +
-+int
-+PyUnstable_ExecStack_Suspend(PyThreadState *tstate, PyUnstable_ExecStack *stack)
++// Move the per-stack state of tstate into `stack`, the stack that is running.
++static int
++suspend(PyThreadState *tstate, PyUnstable_ExecStack *stack)
 +{
-+    assert(tstate != NULL);
-+    assert(tstate == _PyThreadState_GET());
-+    assert(stack != NULL);
 +    _PyThreadStateImpl *impl = (_PyThreadStateImpl *)tstate;
 +
 +    if (stack->cleared) {
@@ -1410,16 +1456,10 @@ index 00000000000..cd6d85cab14
 +    return 0;
 +}
 +
-+int
-+PyUnstable_ExecStack_Resume(PyThreadState *tstate, PyUnstable_ExecStack *target)
++// Install `target`, which has been validated by check_resume_target().
++static void
++resume(PyThreadState *tstate, PyUnstable_ExecStack *target)
 +{
-+    assert(tstate != NULL);
-+    assert(tstate == _PyThreadState_GET());
-+    assert(target != NULL);
-+
-+    if (check_resume_target(tstate, target) < 0) {
-+        return -1;
-+    }
 +    if (target->state == EXECSTACK_NEW) {
 +        target->tstate_id = tstate->id;
 +        init_fresh_state(tstate, target);
@@ -1429,7 +1469,6 @@ index 00000000000..cd6d85cab14
 +        load_state(tstate, target);
 +    }
 +    target->state = EXECSTACK_RUNNING;
-+    return 0;
 +}
 +
 +int
@@ -1449,12 +1488,10 @@ index 00000000000..cd6d85cab14
 +    if (check_resume_target(tstate, target) < 0) {
 +        return -1;
 +    }
-+    if (PyUnstable_ExecStack_Suspend(tstate, current) < 0) {
++    if (suspend(tstate, current) < 0) {
 +        return -1;
 +    }
-+    int err = PyUnstable_ExecStack_Resume(tstate, target);
-+    (void)err;
-+    assert(err == 0);  // target was validated and Resume cannot fail otherwise
++    resume(tstate, target);
 +    return 0;
 +}
 +

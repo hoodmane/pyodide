@@ -18,13 +18,12 @@
 // work there can only be one thread state. See
 // https://github.com/pyodide/pyodide/issues/6479.
 //
-// Why we can use PyUnstable_ExecStack_Switch() (an atomic suspend+resume)
-// rather than the split Suspend()/Resume() that greenlet needs: the
-// interpreter reads the entry frames it keeps on the C stack of the stack
-// being suspended. Our C ("argument") stack region for the outer, event-loop
-// stack lies above Module.stackStop and is never evicted while a task is
-// running, and a task's own region is restored by StackState.restore() before
-// restoreTaskState() runs. So at both switch points both C stacks are intact.
+// PyUnstable_ExecStack_Switch() must be called while the C stack of the stack
+// being suspended is intact, because the interpreter reads the entry frames it
+// keeps there. For us that always holds: the event loop's argument-stack
+// region lies above Module.stackStop and is never evicted while a task runs,
+// and a task's own region is still in place when captureTaskState() runs (it
+// is only evicted later, by another task's StackState.restore()).
 
 #include <stdbool.h>
 #include <stdlib.h>

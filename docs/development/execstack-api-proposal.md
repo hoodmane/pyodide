@@ -78,7 +78,7 @@ per coroutine _and one for the thread's original stack_, and names the
 outgoing and incoming stacks explicitly on every switch. A stack is either
 running (its state is live in the thread state) or not (its state, if any
 yet, is saved in the object); whether a non-running stack has run before only
-matters to `Resume`, which either loads the saved state or starts blank, and
+matters to `Switch`, which either loads the saved state or starts blank, and
 is not exposed.
 
 ```c
@@ -91,7 +91,7 @@ typedef struct _PyExecStack PyUnstable_ExecStack;
 /* A fresh stack: no frames, no datastack, empty exception stack, context =
    Py_XNewRef(context) (NULL => empty context). Recursion depth and tracing
    depth are inherited from the stack being switched *from* on the first
-   Resume() into it. */
+   Switch() into it. */
 PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(PyObject *context);
 
 /* A RUNNING stack standing for whatever is executing on tstate right now:
@@ -112,22 +112,17 @@ PyAPI_FUNC(void) PyUnstable_ExecStack_Free(PyUnstable_ExecStack *);
 
 /* Switching ---------------------------------------------------------------- */
 
-/* Move the per-stack fields of tstate into `stack` (which stops running).
-   `stack` must be the RUNNING stack of tstate. -1 + exception with tstate
-   untouched on failure. Must be
-   called while the *outgoing* C stack is still intact: the interpreter reads
-   the entry frames it keeps there. Until Resume(), no Python code may run. */
-PyAPI_FUNC(int) PyUnstable_ExecStack_Suspend(PyThreadState *, PyUnstable_ExecStack *stack);
+/* Move the per-stack fields of tstate into `current` (the running stack) and
+   install `target` (not running; if run before, on tstate). No-op if they are
+   the same. -1 + exception with tstate untouched on failure.
 
-/* Install `target` (not running; if run before, on tstate) as the
-   running stack after a Suspend(). Call once the *incoming* C stack is in
-   place. -1 + SystemError on misuse only. */
-PyAPI_FUNC(int) PyUnstable_ExecStack_Resume(PyThreadState *, PyUnstable_ExecStack *target);
-
-/* Suspend(current) + Resume(target) for implementations whose two C stacks
-   are both intact at the switch point (separately allocated stacks; Pyodide).
-   No-op if current == target. None of these allocate Python objects or run
-   Python code.
+   Call *before* switching C stacks, while the outgoing C stack is intact: the
+   interpreter reads the entry frames (and, free-threaded, the critical
+   sections) it keeps there. It never reads the incoming C stack -- loading
+   stores pointers into it but does not dereference them -- so the incoming
+   stack need not have been restored yet. No Python code may run between this
+   call and the completion of the C stack switch. Does not allocate Python
+   objects or run Python code.
 
    Implementation detail, invisible to callers: this is where critical
    sections are suspended/resumed, c_stack_refs swapped, entry frames
@@ -182,7 +177,7 @@ Pyodide both run on slices of the thread's own stack.
 - **The thread state is not involved in bookkeeping.** Nothing in
   `PyThreadState` points at an execution stack and `PyThreadState_Clear`
   has no hook; the library names both sides of every switch. The price is
-  that the interpreter cannot detect a misuse such as `Suspend` of a stack
+  that the interpreter cannot detect a misuse such as `Switch` *from* a stack
   that is not actually running (it can only check the per-stack state
   machine and thread id); the benefit is no hidden allocation, no reference
   counting, and no special "root" stack -- the thread's original stack is
@@ -194,7 +189,7 @@ Pyodide both run on slices of the thread's own stack.
   finalizer re-entered the eval loop), records the original link and rewrites
   `previous` to skip the entry frame(s). The raw `current_frame` (which can
   itself transiently be an entry frame during `_PyEval_FrameClearAndPop`) is
-  saved separately from the first visible frame. Resume relinks. This is
+  saved separately from the first visible frame. Loading relinks. This is
   greenlet's `expose_frames`, done by code that owns the frame layout.
 - **Finishing a coroutine is `Switch` to the parent, then `Free`.** No
   `did_finish` special case running on the dying stack; `Free` releases the
@@ -222,8 +217,8 @@ Pyodide both run on slices of the thread's own stack.
 `unexpose_frames`, `set_new_cframe`, `did_finish`, `capture_c_stack_refs`, and
 the `#if GREENLET_PY3xx` ladders are not compiled when `Py_HAVE_EXECSTACK` is
 defined; each `Greenlet` holds one `PyUnstable_ExecStack*`. `g_switchstack`
-calls `Suspend` where `operator<<` used to be (before `slp_switch()`), and
-`g_switchstack_success` calls `Resume` where `operator>>` was. `tp_traverse`
+calls `Switch(current, target)` where `operator<<` used to be (before
+`slp_switch()`); `g_switchstack_success` has nothing left to do. `tp_traverse`
 calls `Traverse`; `tp_clear` calls `Clear` for dead/unstarted/dead-thread
 greenlets and only drops the context for a suspended greenlet in a live
 thread (its frames are unwound by the `GreenletExit` thrown at dealloc). The
@@ -276,15 +271,20 @@ in the saved state, preserving the old isolation guarantee.
 Things the first draft got wrong or left out, found by making greenlet and
 Pyodide actually run:
 
-1. **An atomic swap is not enough for greenlet.** `slp_switch()` overwrites
-   the outgoing greenlet's C stack with the incoming one's before any code
-   after it runs, and the outgoing chain's entry frames live on that C
-   stack. The save must happen before the C stack switch and the load
-   after, so `Suspend`/`Resume` are the primitives and `Switch` is sugar.
-   Pyodide can use `Switch` because its outer argument-stack region is never
-   evicted while a task runs. This is exactly the shape of greenlet's
-   existing `operator<<` / `operator>>` split and is why Mark Shannon's
-   swap-only proposal would not have fit.
+1. **One `Switch` call does work for greenlet, but only called before the C
+   stack switch.** `slp_switch()` overwrites the outgoing greenlet's C stack
+   with the incoming one's, and the outgoing chain's entry frames live
+   there, so the save has to happen first. An intermediate version split
+   the API into `Suspend` (before) and `Resume` (after) on the assumption
+   that loading needed the incoming C stack too. It does not: loading only
+   writes to the thread state and to heap frames (it stores pointers into
+   the incoming C stack without dereferencing them). The one exception was
+   `_PyCriticalSection_Resume` reading the incoming stack's
+   `PyCriticalSection` on free-threaded builds; the mutex pointers are now
+   copied into the stack object at suspension and re-locked from the copy.
+   The contract is therefore "call `Switch` while the outgoing C stack is
+   intact; it does not read the incoming one", which is what greenlet's
+   `operator<<`/`operator>>` pair already satisfied.
 2. **The thread state should not own anything.** A first version had the
    interpreter lazily create a "root" stack per thread, hand out references
    to it, and clean up in `PyThreadState_Clear`; that forced reference
@@ -346,13 +346,15 @@ Pyodide actually run:
 10. **Windows / PCbuild and `Misc/stable_abi.toml`**: unstable API, so no
     stable-ABI entry; PCbuild has `Python/execstack.c` added but is
     untested.
-11. **Free-threaded builds** compile but were not tested; greenlet's
-    `critical_section` suspend/resume and `c_stack_refs` snapshot logic was
-    transcribed into `execstack.c`, and greenlet's FT-specific tests
-    (`test_issue515_*`, `test_c_stack_refs_suspended_gc`) would be the
-    verification.
-12. **Should `Suspend` be allowed to fail at all?** Its only failure is
+11. **Free-threaded builds**: the C-API test suite passes on a
+    `--disable-gil` debug build, including a test that suspends a fiber from
+    inside `dict.setdefault`'s `__hash__` call while the dict's critical
+    section is held (it deadlocks without the suspend/resume of critical
+    sections). greenlet itself has not been built free-threaded against
+    this branch; its `test_issue515_*` and `test_c_stack_refs_suspended_gc`
+    would be the next check.
+12. **Should `Switch` be allowed to fail for lack of memory?** Its only failure is
     `PyMem_RawRealloc` for the entry-frame link table. Reserving that at
     `New()` time with a fixed capacity and growing lazily on the running
-    stack (where allocation is safe) would make `Suspend` infallible, which
+    stack (where allocation is safe) would make `Switch` infallible, which
     greenlet's `g_switchstack` would prefer.
