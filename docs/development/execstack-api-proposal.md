@@ -99,7 +99,7 @@ PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_New(PyObject *context);
 PyAPI_FUNC(PyUnstable_ExecStack *) PyUnstable_ExecStack_Adopt(PyThreadState *);
 
 /* Release everything the stack owns: context, exc_value, asyncio task,
-   datastack chunks, and -- if SUSPENDED with live frames -- clear those
+   datastack chunks, and -- if suspended with live frames -- clear those
    frames the way gen_clear / _PyFrame_ClearExceptCode do. The stack stays
    allocated but can no longer be switched into. -1 + SystemError if RUNNING
    on this thread. */
@@ -112,14 +112,14 @@ PyAPI_FUNC(void) PyUnstable_ExecStack_Free(PyUnstable_ExecStack *);
 
 /* Switching ---------------------------------------------------------------- */
 
-/* Move the per-stack fields of tstate into `stack` and mark it SUSPENDED.
+/* Move the per-stack fields of tstate into `stack` (which stops running).
    `stack` must be the RUNNING stack of tstate. -1 + exception with tstate
    untouched on failure. Must be
    called while the *outgoing* C stack is still intact: the interpreter reads
    the entry frames it keeps there. Until Resume(), no Python code may run. */
 PyAPI_FUNC(int) PyUnstable_ExecStack_Suspend(PyThreadState *, PyUnstable_ExecStack *stack);
 
-/* Install `target` (NEW, or SUSPENDED and previously run on tstate) as the
+/* Install `target` (not running; if run before, on tstate) as the
    running stack after a Suspend(). Call once the *incoming* C stack is in
    place. -1 + SystemError on misuse only. */
 PyAPI_FUNC(int) PyUnstable_ExecStack_Resume(PyThreadState *, PyUnstable_ExecStack *target);
@@ -141,7 +141,7 @@ PyAPI_FUNC(int) PyUnstable_ExecStack_IsRunning(PyUnstable_ExecStack *);
 
 /* New reference to the topmost *complete* Python frame, or NULL (error
    cleared) if there is none -- same contract as PyThreadState_GetFrame().
-   For a SUSPENDED stack the result and its f_back chain are safe to walk;
+   For a non-running stack the result and its f_back chain are safe to walk;
    CPython is responsible for skipping entry frames. */
 PyAPI_FUNC(PyFrameObject *) PyUnstable_ExecStack_GetFrame(PyUnstable_ExecStack *);
 
@@ -151,9 +151,9 @@ PyAPI_FUNC(int)        PyUnstable_ExecStack_SetContext(PyUnstable_ExecStack *, P
 /* GC integration ----------------------------------------------------------- */
 
 /* For the owning object's tp_traverse. Visits context, exc_value, asyncio
-   task, and -- when SUSPENDED -- every thread-owned frame and its evaluation
+   task, and -- when not running -- every thread-owned frame and its evaluation
    stack (same as gen_traverse), plus objects held by C-stack refs captured
-   at suspension. Visits only the context while RUNNING or NEW. */
+   at suspension. Visits only the context while running or never run. */
 PyAPI_FUNC(int) PyUnstable_ExecStack_Traverse(PyUnstable_ExecStack *, visitproc, void *);
 ```
 
@@ -200,10 +200,10 @@ Pyodide both run on slices of the thread's own stack.
   `did_finish` special case running on the dying stack; `Free` releases the
   root datastack chunk.
 - **Killing from a dead thread** (greenlet's `murder_in_place` /
-  `tp_clear(own_top_frame=true)`) is `Clear`/`Free` on a `SUSPENDED` stack;
+  `tp_clear(own_top_frame=true)`) is `Clear`/`Free` on a non-running stack;
   CPython does the stackref clearing top-down so `take_ownership` can still
   link `f_back`.
-- **GC model = suspended generator.** A `SUSPENDED` stack is owned by its
+- **GC model = suspended generator.** A suspended stack is owned by its
   library object and traversed via that object's `tp_traverse`, so cycles
   through it are collectable. It is _not_ registered as a thread-stack root
   (that would pin everything a suspended coroutine references). On
@@ -211,7 +211,7 @@ Pyodide both run on slices of the thread's own stack.
   snapshotted as strong references, as greenlet does.
 - **Thread exit.** Nothing happens at the interpreter level. A stack that
   was `RUNNING` when its thread exited owns nothing (its live state went
-  with the thread) and is simply freed by its owner; a `SUSPENDED` one still
+  with the thread) and is simply freed by its owner; a suspended one still
   owns its frames and is cleared/freed by its owner as usual. Stacks record
   their thread by `tstate->id`, never by pointer, so a stack outliving its
   thread is safe.
@@ -296,7 +296,7 @@ Pyodide actually run:
    by setting the error indicator and switching; so does throwing into a
    never-started greenlet. Making `current_exception` per-stack would have
    broken that, so it is deliberately excluded (and the C-API test covers
-   `throw` into both `NEW` and `SUSPENDED` stacks).
+   `throw` into both never-run and suspended stacks).
 4. **`tp_clear` of a live suspended coroutine must not clear its frames.**
    greenlet unwinds them by throwing `GreenletExit` at dealloc so `finally`
    blocks run; `Clear` is for stacks that will never run again. The API is
